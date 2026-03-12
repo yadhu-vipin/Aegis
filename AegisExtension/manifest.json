@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Aegis Download Guard",
+  "version": "1.0",
+  "description": "Intercepts downloads for sandbox analysis.",
+  "permissions": [
+    "downloads",
+    "nativeMessaging"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

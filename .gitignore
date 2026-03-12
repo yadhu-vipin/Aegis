@@ -1,0 +1,7 @@
+phish/
+URL/*.csv
+*.pth
+target/
+**/target/
+__pycache__/
+.ipynb_checkpoints/

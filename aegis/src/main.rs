@@ -1,83 +1,115 @@
-use std::io::{self, Read, Write, BufWriter}; // Added Write and BufWriter
-use std::fs::OpenOptions; // For creating the "Cage" file
-use serde::Deserialize;
-use base64::{engine::general_purpose, Engine as _};
+use reqwest;
+use serde::{Deserialize, Serialize};
+use std::io::{self, Read, Write};
+use tokio;
 
+// Import your custom modules
+mod hcs;
 mod scanner;
 
-#[derive(Deserialize, Debug)]
-struct IncomingMessage {
-    #[serde(rename = "type")] 
-    msg_type: String,
-    filename: Option<String>,
-    payload: Option<String>,
-    is_final: Option<bool>, // NEW: Browser tells us if this is the last chunk
+#[derive(Deserialize)]
+struct DownloadStruct {
+    url: String,
+    filename: String,
 }
 
-fn read_input() -> io::Result<Vec<u8>> {
-    let mut length_bytes = [0u8; 4];
-    if let Err(_) = io::stdin().read_exact(&mut length_bytes) {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "End of stream"));
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    // 1. READ THE MESSAGE FROM CHROME
+    // Native Messaging sends a 4-byte header containing the length of the JSON
+    let mut length_buf = [0u8; 4];
+    if let Err(_) = io::stdin().read_exact(&mut length_buf) {
+        return Ok(()); // Exit gracefully if Chrome closes the pipe
     }
 
-    let len = u32::from_ne_bytes(length_bytes) as usize;
+    let length = u32::from_le_bytes(length_buf);
 
-    // SECURITY: Since we use 1MB chunks now, we lower this limit to 2MB 
-    // to prevent memory exhaustion attacks.
-    if len > 2 * 1024 * 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Chunk too large"));
-    }
+    let mut json_buf = vec![0u8; length as usize];
+    io::stdin().read_exact(&mut json_buf)?;
 
-    let mut buffer = vec![0u8; len];
-    io::stdin().read_exact(&mut buffer)?;
-    Ok(buffer)
-}
+    // Parse the JSON into our struct
+    let request: DownloadStruct = serde_json::from_slice(&json_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-fn main() -> io::Result<()> {
-    eprintln!("[Aegis] Native Host Active. Streaming Mode Engaged.");
+    // 2. INITIALIZE THE STREAMING CLIENT
+    let client = reqwest::Client::new();
+    let mut res = client
+        .get(&request.url)
+        .send()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    // The Cage: Create a temporary file on SSD for the 8GB stream
-    let temp_path = "C:\\Aegis\\quarantine\\scan.tmp";
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true) // Start fresh
-        .open(temp_path)?;
-    let mut writer = BufWriter::new(file);
+    // The "Cage" - Temporary quarantine file
+    let tmp_path = "C:\\Aegis\\quarantine\\scan.tmp";
+    let mut file = std::fs::File::create(tmp_path)?;
 
-    loop {
-        match read_input() {
-            Ok(buffer) => {
-                match serde_json::from_slice::<IncomingMessage>(&buffer) {
-                    Ok(msg) => {
-                        if let Some(encoded) = msg.payload {
-                            let chunk_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
-                            
-                            // 1. THE SIEVE: Scan chunk in RAM before writing to disk
-                            scanner::detect_dangerous_intent(&chunk_bytes);
-                            
-                            // 2. THE CAGE: XOR Obfuscation (Optional but Mega) 
-                            // and write to SSD
-                            writer.write_all(&chunk_bytes)?;
-                        }
+    // 3. THE STREAMING SIEVE-AND-CAGE LOOP
+    let mut is_first = true;
+    let mut is_malicious = false;
 
-                        if msg.is_final.unwrap_or(false) {
-                            writer.flush()?;
-                            eprintln!("[Aegis] File fully caged. Starting Sandbox Trial...");
-                            // This is where you'd call the HCS Sandbox on temp_path
-                            break; 
-                        }
-                    }
-                    Err(e) => eprintln!("[Aegis] JSON Parse Error: {}", e),
-                }
-            }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("[Aegis] Connection Error: {}", e);
-                }
-                break;
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    {
+        // LEVEL 1 & 2: Static & Forensic Scan
+        // If the scanner returns 'false', the file is flagged as malicious
+        if !scanner::deep_forensic_scan(&chunk, &request.filename, is_first) {
+            is_malicious = true;
+            break; // THE KILL SWITCH: Break loop, stopping the network stream
+        }
+
+        is_first = false;
+
+        // Simple XOR Cipher (Key: 0xAC)
+        fn xor_buffer(data: &mut [u8]) {
+            for byte in data.iter_mut() {
+                *byte ^= 0xAC;
             }
         }
+        // Level 3 & 4: Write the chunk to disk (The Cage)
+        file.write_all(&chunk)?;
     }
+
+    // 4. THE VERDICT
+    if is_malicious {
+        // Cleanup: Remove the dangerous partial file
+        drop(file); // Close file handle before deleting
+        let _ = std::fs::remove_file(tmp_path);
+
+        send_response(
+            "BLOCKED",
+            "Critical: File identity mismatch or malicious intent detected.",
+        );
+    } else {
+        // Level 5: Behavioral Analysis (The Bubble)
+        // Static scan passed, now we run it in the HCS Sandbox
+        println!("[Aegis] Static scan passed. Moving to HCS Sandbox...");
+
+        match hcs::start_behavioral_scan(tmp_path) {
+            Ok(_) => send_response("COMPLETE", "File analyzed and verified clean.")?,
+            Err(e) => send_response("ERROR", &format!("Sandbox execution failed: {}", e))?,
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper function to send JSON responses back to the Chrome Extension
+fn send_response(status: &str, verdict: &str) -> io::Result<()> {
+    let response = serde_json::json!({
+        "status": status,
+        "verdict": verdict
+    });
+
+    let response_str = response.to_string();
+    let res_bytes = response_str.as_bytes();
+    let res_len = res_bytes.len() as u32;
+
+    // Standard Native Messaging Output: [4-byte length] + [JSON data]
+    io::stdout().write_all(&res_len.to_le_bytes())?;
+    io::stdout().write_all(res_bytes)?;
+    io::stdout().flush()?;
+
     Ok(())
 }

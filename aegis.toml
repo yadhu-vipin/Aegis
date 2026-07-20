@@ -1,0 +1,41 @@
+# Aegis Host Configuration
+# Central config file — all tunables live here, never in compiled code.
+
+[host]
+# Log level: error | warn | info | debug | trace
+log_level = "info"
+
+[ml]
+# URL of the local ML inference service
+service_url = "http://127.0.0.1:8787/score"
+# Timeout in milliseconds for ML service calls
+timeout_ms = 500
+
+[risk]
+# Score >= sandbox_threshold -> send to HCS detonation
+sandbox_threshold = 0.4
+# Score >= block_threshold -> block outright, skip sandbox, notify user
+block_threshold = 0.85
+
+[chunking]
+# Chunk size in bytes (256 KB default)
+chunk_size = 262144
+# How many chunks to keep in ring buffer for cross-chunk intent scanning
+ring_buffer_chunks = 4
+# Per-chunk read timeout in seconds
+per_chunk_timeout_secs = 30
+# Total transfer timeout in seconds (1 hour)
+total_transfer_timeout_secs = 3600
+
+[sandbox]
+# Detonation timeout in seconds
+detonation_timeout_secs = 30
+# Max file size in bytes for HCS detonation (250 MB)
+# Files larger than this skip live detonation: static-only verdict + warning
+max_detonation_size = 262144000
+
+[quarantine]
+# Quarantine subdirectory name under system temp dir
+subdir = "aegis_quarantine"
+# Whether to keep flagged samples on disk after verdict (false = delete)
+keep_flagged_samples = false

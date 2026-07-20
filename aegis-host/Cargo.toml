@@ -1,0 +1,42 @@
+[package]
+name = "aegis-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aegis-host"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.11", features = ["stream", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+anyhow = "1.0"
+async-trait = "0.1"
+uuid = { version = "1.11", features = ["v4"] }
+base64 = "0.22"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_HostComputeSystem",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

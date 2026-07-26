@@ -1,5 +1,7 @@
 //! Scanner orchestrator — `deep_forensic_scan()` as specified in the build spec.
 
+#![allow(dead_code)]
+
 pub mod magic_bytes;
 pub mod intent;
 

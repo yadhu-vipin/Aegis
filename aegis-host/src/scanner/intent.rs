@@ -53,6 +53,8 @@ static WINAPI_RED_FLAGS: &[(&str, f32, &str)] = &[
     ("nc -e /bin/sh",          0.8,  "Netcat reverse shell"),
     ("nc -e /bin/bash",        0.8,  "Netcat reverse shell"),
     ("/dev/tcp/",              0.7,  "Bash TCP socket — reverse shell pattern"),
+    // Standard Antivirus Test Signature
+    ("EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 1.0, "EICAR Antivirus Test File signature"),
 ];
 
 /// Scan a chunk (and optionally a small prefix from the previous chunk for
@@ -93,4 +95,34 @@ pub fn detect_dangerous_intent(data: &[u8], context_prefix: Option<&[u8]>) -> Re
         flags,
         risk: cumulative_risk,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_buffer() {
+        let data = b"Hello world, this is a clean file content.";
+        let res = detect_dangerous_intent(data, None).unwrap();
+        assert!(!res.flagged);
+        assert_eq!(res.risk, 0.0);
+    }
+
+    #[test]
+    fn test_winapi_injection_flag() {
+        let data = b"Some code calling CreateRemoteThread to inject shellcode";
+        let res = detect_dangerous_intent(data, None).unwrap();
+        assert!(res.flagged);
+        assert!(res.risk >= 0.6);
+    }
+
+    #[test]
+    fn test_cross_boundary_pattern() {
+        let prefix = b"Executing CreateRemote";
+        let chunk = b"Thread now!";
+        let res = detect_dangerous_intent(chunk, Some(prefix)).unwrap();
+        assert!(res.flagged);
+        assert!(res.risk >= 0.6);
+    }
 }

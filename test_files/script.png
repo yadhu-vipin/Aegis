@@ -1,0 +1,3 @@
+#!/bin/bash
+# Script masquerading as PNG image
+echo "Magic bytes added successfully!"

@@ -1,0 +1,9 @@
+{
+  "name": "com.aegis.sandbox",
+  "description": "Aegis Host Sandbox Native Messaging Host",
+  "path": "aegis-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://aegisdownloadguardextensionid/"
+  ]
+}

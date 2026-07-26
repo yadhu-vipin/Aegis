@@ -26,7 +26,6 @@ use sandbox::{PlatformSandbox, Sandbox};
 use scanner::ForensicResult;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tracing::Level;
 
@@ -53,7 +52,7 @@ async fn run() -> Result<()> {
     tracing::info!("Aegis host started. Config loaded.");
 
     let quarantine = Quarantine::new(&cfg.quarantine.subdir)?;
-    let sandbox = PlatformSandbox::default();
+    let sandbox = PlatformSandbox;
 
     // Main message loop — process one session per invocation (Chrome spawns
     // a new host process per port.connectNative() call).

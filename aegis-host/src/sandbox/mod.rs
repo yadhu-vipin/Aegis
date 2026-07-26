@@ -3,6 +3,8 @@
 //! On Windows: `PlatformSandbox` = `HcsSandbox` (real HCS detonation).
 //! On Unix/Linux: `PlatformSandbox` = `StubSandbox` (dev-mode no-op, logs intent).
 
+#![allow(dead_code)]
+
 pub mod linux_stub;
 #[cfg(windows)]
 pub mod windows_hcs;

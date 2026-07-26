@@ -8,7 +8,7 @@
 //! - On Windows: Restrictive ACL (Aegis service account only) — see `apply_windows_acl`.
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Manage a quarantine directory and produce safe file paths.
@@ -161,7 +161,7 @@ pub fn sanitize_filename(filename: &str) -> String {
 }
 
 /// Query available disk space for the path's filesystem.
-fn available_space(path: &PathBuf) -> Result<u64> {
+fn available_space(path: &Path) -> Result<u64> {
     #[cfg(unix)]
     {
         use std::mem::MaybeUninit;
@@ -174,7 +174,7 @@ fn available_space(path: &PathBuf) -> Result<u64> {
             bail!("statvfs failed on {}: {}", path.display(), err);
         }
         let stat = unsafe { stat.assume_init() };
-        Ok(stat.f_bavail * stat.f_bsize as u64)
+        Ok(stat.f_bavail * stat.f_bsize)
     }
 
     #[cfg(windows)]

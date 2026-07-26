@@ -4,6 +4,8 @@
 //! current working directory as a fallback). Fails fast with a clear error
 //! if the file is missing or malformed — never silently defaults.
 
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;

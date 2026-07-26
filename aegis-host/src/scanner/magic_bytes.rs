@@ -180,3 +180,32 @@ fn get_extension(filename: &str) -> String {
         .unwrap_or("")
         .to_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exe_disguised_as_jpg() {
+        let fake_jpg_header = b"\x4D\x5A\x90\x00\x03\x00\x00\x00"; // PE header (exe)
+        let res = scan_file(fake_jpg_header, "photo.jpg").unwrap();
+        assert!(res.mismatch);
+        assert_eq!(res.risk, 0.8);
+    }
+
+    #[test]
+    fn test_valid_png() {
+        let png_header = b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A";
+        let res = scan_file(png_header, "image.png").unwrap();
+        assert!(!res.mismatch);
+        assert_eq!(res.risk, 0.0);
+    }
+
+    #[test]
+    fn test_valid_docx_as_zip() {
+        let zip_header = b"\x50\x4B\x03\x04\x14\x00\x06\x00";
+        let res = scan_file(zip_header, "document.docx").unwrap();
+        assert!(!res.mismatch);
+        assert_eq!(res.risk, 0.0);
+    }
+}

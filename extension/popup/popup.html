@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Aegis Protection</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <span class="shield-icon">🛡️</span>
+      <span class="title-text">Aegis Guard</span>
+    </div>
+    <div class="status-badge" id="protection-status">Active</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Protection Controls</div>
+    <div class="toggle-row">
+      <span>Layer 1: URL Hover Check</span>
+      <label class="switch">
+        <input type="checkbox" id="toggle-layer1" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <span>Layer 2: Download Sandboxing</span>
+      <label class="switch">
+        <input type="checkbox" id="toggle-layer2" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Recent Download Verdicts</div>
+    <div class="verdict-list" id="verdict-list">
+      <div class="empty-state">No recent download activity.</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span>Aegis v1.0.0 | Endpoint Download Safety</span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

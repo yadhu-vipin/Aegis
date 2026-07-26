@@ -1,6 +1,8 @@
 //! Risk decision module — translates ForensicResult + sandbox verdict
 //! into actionable decisions using thresholds from aegis.toml.
 
+#![allow(dead_code)]
+
 use crate::config::RiskConfig;
 use crate::scanner::ForensicResult;
 use crate::sandbox::Verdict;

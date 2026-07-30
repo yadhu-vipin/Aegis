@@ -1,9 +1,0 @@
-{
-  "name": "com.aegis.sandbox",
-  "description": "Aegis Rust Sandbox Host",
-  "path": "../Deeplearning_Backyard/aegis",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://agegjnhaghdkbpnnpppcfbohoieiikhn/"
-  ]
-}

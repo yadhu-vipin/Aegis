@@ -119,21 +119,118 @@ input:checked + .slider:before {
   border-left: 4px solid #64748b;
 }
 
-.verdict-item.COMPLETE { border-left-color: #10b981; }
-.verdict-item.BLOCKED { border-left-color: #ef4444; }
-.verdict-item.WARNING { border-left-color: #f59e0b; }
+.verdict-item.COMPLETE, .verdict-item.ok       { border-left-color: #10b981; }
+.verdict-item.BLOCKED,  .verdict-item.blocked  { border-left-color: #ef4444; }
+.verdict-item.WARNING,  .verdict-item.warn     { border-left-color: #f59e0b; }
+.verdict-item.scanning                          { border-left-color: #2563eb; }
 
 .verdict-filename {
   font-weight: bold;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
 }
 
 .verdict-detail {
   font-size: 11px;
   color: #94a3b8;
   margin-top: 2px;
+}
+
+/* --- verdict rows --------------------------------------------------- */
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+.link-btn:hover { color: #94a3b8; text-decoration: underline; }
+
+.blocked-count {
+  font-size: 11px;
+  color: #64748b;
+  margin-bottom: 8px;
+}
+
+.verdict-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.verdict-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.verdict-time {
+  font-size: 10px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+/* The plain-language reason — the line that actually tells the user why a
+   download vanished, and the whole point of this panel. */
+.verdict-reason {
+  font-size: 11px;
+  color: #cbd5e1;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.verdict-details { margin-top: 6px; }
+
+.verdict-details summary {
+  font-size: 10px;
+  color: #64748b;
+  cursor: pointer;
+  outline: none;
+}
+.verdict-details summary:hover { color: #94a3b8; }
+
+.verdict-technical {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10px;
+  color: #94a3b8;
+  background-color: #0f172a;
+  border-radius: 4px;
+  padding: 6px;
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.verdict-path {
+  font-size: 10px;
+  color: #10b981;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+.spin {
+  display: inline-block;
+  animation: aegis-spin 1s linear infinite;
+}
+
+@keyframes aegis-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation: none; }
 }
 
 .footer {

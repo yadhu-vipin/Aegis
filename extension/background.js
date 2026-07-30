@@ -31,8 +31,19 @@
 const NATIVE_HOST_NAME = "com.aegis.sandbox";
 const ML_SERVICE_URL = "http://127.0.0.1:8787/score";
 
-/** Must match `quarantine.subdir` in aegis.toml. */
-const QUARANTINE_SUBDIR = "aegis-quarantine";
+/**
+ * MUST match `quarantine.subdir` in aegis.toml exactly.
+ *
+ * These two values live in different languages and cannot share a constant, so
+ * they can silently drift — and they did: this was "aegis-quarantine" (hyphen)
+ * while aegis.toml said "aegis_quarantine" (underscore), which made the host
+ * reject every single download as being outside the quarantine root.
+ *
+ * The failure is at least loud (REJECTED_MALFORMED naming both paths), and
+ * `quarantine_subdir_matches_config` in tests/ipc_roundtrip.rs asserts the two
+ * stay in sync. If you change one, change the other.
+ */
+const QUARANTINE_SUBDIR = "aegis_quarantine";
 
 /** downloadId -> session state */
 const activeSessions = new Map();
@@ -57,6 +68,95 @@ async function setBadge(text, color) {
     await chrome.action.setBadgeText({ text });
     if (color) await chrome.action.setBadgeBackgroundColor({ color });
   } catch { /* action API unavailable in some contexts */ }
+}
+
+// ---------------------------------------------------------------------------
+// User-visible feedback
+// ---------------------------------------------------------------------------
+//
+// A security tool that blocks silently is indistinguishable from a broken one.
+// If Aegis stops a download, the user must be told what happened and why —
+// otherwise the file just vanishes and they assume the download failed.
+
+/**
+ * Turn the host's technical verdict into one plain sentence.
+ *
+ * The host's strings are precise but dense, e.g.
+ *   "Risk score 1.00 crossed block threshold 0.85 after 68 bytes.
+ *    Signals: [risk=0.80] nc -e /bin/sh: Netcat reverse shell; ..."
+ * The notification gets the human summary; the popup keeps the full detail.
+ */
+function humanReason(verdictText = "") {
+  const t = verdictText.toLowerCase();
+
+  if (t.includes("another security product") || t.includes("windows defender")) {
+    return "Windows Defender identified this file as malware and removed it.";
+  }
+  if (t.includes("reverse shell") || t.includes("netcat")) {
+    return "The file contained a reverse-shell command — a remote-access backdoor.";
+  }
+  if (t.includes("eicar")) {
+    return "The file matched the EICAR antivirus test signature.";
+  }
+  if (t.includes("masquerad") || t.includes("mismatch")) {
+    return "The file's real type doesn't match its extension — a program disguised as a document or image.";
+  }
+  if (t.includes("injection") || t.includes("createremotethread")) {
+    return "The file contained process-injection code used to hijack other programs.";
+  }
+  if (t.includes("keylog") || t.includes("setwindowshookex")) {
+    return "The file contained keylogging code.";
+  }
+  if (t.includes("persistence") || t.includes("autorun")) {
+    return "The file tried to install itself to run automatically at startup.";
+  }
+  if (t.includes("sandbox analysis failed") || t.includes("sandbox verdict")) {
+    return "The file behaved suspiciously when run in an isolated sandbox.";
+  }
+  if (t.includes("incomplete") || t.includes("truncat")) {
+    return "The download ended early, so it could not be fully checked.";
+  }
+  if (t.includes("could not verify") || t.includes("unreachable") || t.includes("disconnected")) {
+    return "Aegis couldn't finish scanning this file, so it was not saved.";
+  }
+  if (t.includes("too large")) {
+    return "The file was too large to analyse safely.";
+  }
+  if (t.includes("stalled")) {
+    return "The download stalled and was abandoned.";
+  }
+  return "Aegis found something suspicious in this file.";
+}
+
+let notificationSeq = 0;
+
+/**
+ * Raise a desktop notification. Blocks are loud; releases stay quiet so we
+ * don't train the user to dismiss Aegis notifications on reflex.
+ */
+function notify({ blocked, filename, verdictText, earlyKill }) {
+  const id = `aegis-${Date.now()}-${notificationSeq++}`;
+
+  const title = blocked
+    ? (earlyKill ? "Aegis stopped a download mid-transfer" : "Aegis blocked a download")
+    : "Aegis cleared a download";
+
+  const message = blocked
+    ? `${filename}\n\n${humanReason(verdictText)}\n\nThe file was not saved to your computer.`
+    : `${filename} was scanned and saved.`;
+
+  try {
+    chrome.notifications.create(id, {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title,
+      message,
+      priority: blocked ? 2 : 0,
+      requireInteraction: !!blocked
+    }, () => void chrome.runtime.lastError);
+  } catch (err) {
+    console.warn("[Aegis] notification failed:", err);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +299,15 @@ function beginWatch(downloadId, session) {
         // The whole point of the design: kill it before it finishes arriving.
         console.warn(`[Aegis] EARLY BLOCK (risk ${msg.risk_score}): ${msg.reason}`);
         session.state = "blocked";
+        session.earlyKill = true;
         chrome.downloads.cancel(downloadId, () => void chrome.runtime.lastError);
         setBadge("!", "#c0392b");
+        notify({
+          blocked: true,
+          earlyKill: true,
+          filename: session.originalFilename,
+          verdictText: msg.reason
+        });
         break;
 
       case "VERDICT":
@@ -251,8 +358,18 @@ function handleVerdict(downloadId, session, msg) {
     url: session.url,
     status: msg.status,
     verdict: msg.verdict,
+    reason: humanReason(msg.verdict),
     releasedPath: msg.released_path || null
   });
+
+  // EARLY_BLOCK already notified; don't fire twice for the same download.
+  if (!session.earlyKill) {
+    notify({
+      blocked: !released,
+      filename: session.originalFilename,
+      verdictText: msg.verdict
+    });
+  }
 
   setBadge(released ? "" : "!", released ? undefined : "#c0392b");
   finishSession(downloadId);
@@ -266,15 +383,19 @@ function failClosed(downloadId, session, reason) {
   session.state = "blocked";
   chrome.downloads.cancel(downloadId, () => void chrome.runtime.lastError);
 
+  const verdict =
+    `Download cancelled because Aegis could not verify it (${reason}). ` +
+    `The file was not saved.`;
+
   saveVerdict({
     filename: session.originalFilename,
     url: session.url,
     status: "BLOCKED",
-    verdict:
-      `Download cancelled because Aegis could not verify it (${reason}). ` +
-      `The file was not saved.`
+    verdict,
+    reason: humanReason(verdict)
   });
 
+  notify({ blocked: true, filename: session.originalFilename, verdictText: verdict });
   setBadge("!", "#c0392b");
   finishSession(downloadId);
 }

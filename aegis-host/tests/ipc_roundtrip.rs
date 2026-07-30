@@ -337,6 +337,49 @@ fn unknown_message_type_is_rejected() {
     assert_eq!(status_of(v[0]), "REJECTED_MALFORMED");
 }
 
+/// The quarantine directory name is duplicated across a language boundary:
+/// `quarantine.subdir` in aegis.toml, and `QUARANTINE_SUBDIR` in the
+/// extension's background.js. They cannot share a constant, so they can drift —
+/// and they did. background.js said "aegis-quarantine" (hyphen) while
+/// aegis.toml said "aegis_quarantine" (underscore), so the host rejected every
+/// legitimate download as being outside the quarantine root.
+///
+/// Nothing else catches this: both files are individually valid, the extension
+/// loads fine, and the host runs fine. It only shows up as "every download is
+/// mysteriously rejected".
+#[test]
+fn quarantine_subdir_matches_config() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root");
+
+    let toml_src = std::fs::read_to_string(root.join("aegis.toml")).expect("read aegis.toml");
+    let cfg: toml::Value = toml_src.parse().expect("parse aegis.toml");
+    let configured = cfg
+        .get("quarantine")
+        .and_then(|q| q.get("subdir"))
+        .and_then(|s| s.as_str())
+        .expect("aegis.toml [quarantine].subdir");
+
+    let js = std::fs::read_to_string(root.join("extension/background.js"))
+        .expect("read background.js");
+    let line = js
+        .lines()
+        .find(|l| l.contains("const QUARANTINE_SUBDIR"))
+        .expect("background.js must define QUARANTINE_SUBDIR");
+    let js_value = line
+        .split('"')
+        .nth(1)
+        .expect("QUARANTINE_SUBDIR must be a double-quoted string literal");
+
+    assert_eq!(
+        js_value, configured,
+        "quarantine directory name has drifted: background.js says {js_value:?} but \
+         aegis.toml says {configured:?}. The host resolves the quarantine root from \
+         aegis.toml, so every download would be rejected as out-of-root."
+    );
+}
+
 /// A message with no `type` field at all.
 #[test]
 fn missing_type_field_is_rejected() {

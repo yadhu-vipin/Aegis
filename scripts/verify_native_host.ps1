@@ -1,10 +1,10 @@
-# Aegis — Native Messaging Host Diagnostic
+# Aegis - Native Messaging Host Diagnostic
 #
 # Answers one question: can the browser actually launch the Aegis host?
 #
 # "Specified native messaging host not found" gives no detail about WHICH link
 # in the chain broke, and the extension's fail-closed policy turns that single
-# failure into "every download is blocked" — a symptom that looks nothing like
+# failure into "every download is blocked" - a symptom that looks nothing like
 # its cause. This walks the whole chain the way the browser does and names the
 # broken link.
 #
@@ -102,15 +102,15 @@ Write-Host "Host activity:" -ForegroundColor Cyan
 $log = Join-Path $env:LOCALAPPDATA "Aegis\aegis-host.log"
 if (Test-Path $log) {
     $size = (Get-Item $log).Length
-    Write-Host "  [ ok ] log exists ($size bytes) — the browser HAS launched the host" -ForegroundColor Green
+    Write-Host "  [ ok ] log exists ($size bytes) - the browser HAS launched the host" -ForegroundColor Green
     Write-Host "         $log" -ForegroundColor DarkGray
     Write-Host "  last 5 lines:" -ForegroundColor DarkGray
     Get-Content $log -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
 } else {
-    Write-Host "  [!!] NO LOG FILE — the browser has never launched the host." -ForegroundColor Yellow
+    Write-Host "  [!!] NO LOG FILE - the browser has never launched the host." -ForegroundColor Yellow
     Write-Host "       If the chain above is all [ok], the browser simply has not" -ForegroundColor Yellow
     Write-Host "       re-read the registry yet. It is read at browser startup, and" -ForegroundColor Yellow
-    Write-Host "       closing the window is NOT enough — Edge and Chrome keep" -ForegroundColor Yellow
+    Write-Host "       closing the window is NOT enough - Edge and Chrome keep" -ForegroundColor Yellow
     Write-Host "       background processes alive." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "       Fix: browse to  edge://restart  (or chrome://restart)." -ForegroundColor Cyan
@@ -121,6 +121,6 @@ Write-Host ""
 if ($anyGood) {
     Write-Host "Registration chain is intact for at least one browser." -ForegroundColor Green
 } else {
-    Write-Host "Registration is broken — re-run install_native_host.ps1." -ForegroundColor Red
+    Write-Host "Registration is broken - re-run install_native_host.ps1." -ForegroundColor Red
     exit 1
 }

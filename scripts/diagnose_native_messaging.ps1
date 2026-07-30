@@ -1,4 +1,4 @@
-# Aegis — capture what the browser ACTUALLY says about native messaging
+# Aegis - capture what the browser ACTUALLY says about native messaging
 #
 # Chromium only writes native-messaging failures to its debug log, and that log
 # is off by default. Without it you get the extension's second-hand view
@@ -28,7 +28,7 @@ $Config = @{
 $LogPath = Join-Path $Config.UserData "chrome_debug.log"
 
 # ---------------------------------------------------------------------------
-# Phase 2 — analyse
+# Phase 2 - analyse
 # ---------------------------------------------------------------------------
 if ($Analyze) {
     if (-not (Test-Path $LogPath)) {
@@ -59,7 +59,7 @@ if ($Analyze) {
         Write-Host "NO native-messaging lines at all." -ForegroundColor Yellow
         Write-Host ""
         Write-Host "That means the extension never called connectNative during this" -ForegroundColor Yellow
-        Write-Host "session — so the service worker probably did not start. Open the" -ForegroundColor Yellow
+        Write-Host "session - so the service worker probably did not start. Open the" -ForegroundColor Yellow
         Write-Host "Aegis popup (that wakes it) and re-run with -Analyze." -ForegroundColor Yellow
         exit 0
     }
@@ -85,7 +85,7 @@ if ($Analyze) {
 
     if ($all -match "com\.aegis\.echo" -and $all -notmatch "Can't find manifest for native messaging host com\.aegis\.echo") {
         Write-Host "  The REFERENCE host was reached." -ForegroundColor Green
-        Write-Host "  Native messaging works here — the fault is specific to the" -ForegroundColor Green
+        Write-Host "  Native messaging works here - the fault is specific to the" -ForegroundColor Green
         Write-Host "  Aegis registration. Diff the two manifests in C:\Aegis\." -ForegroundColor Green
     }
     elseif ($all -match "Can't find manifest") {
@@ -93,7 +93,7 @@ if ($Analyze) {
         Write-Host "  path the registry provably points to." -ForegroundColor Red
         Write-Host ""
         Write-Host "  Chromium reports this when it does not consult the registry" -ForegroundColor Yellow
-        Write-Host "  location we wrote — which happens when user-level native hosts" -ForegroundColor Yellow
+        Write-Host "  location we wrote - which happens when user-level native hosts" -ForegroundColor Yellow
         Write-Host "  are disabled by policy. HKCU is skipped entirely and only HKLM" -ForegroundColor Yellow
         Write-Host "  is searched." -ForegroundColor Yellow
         Write-Host ""
@@ -101,19 +101,19 @@ if ($Analyze) {
         Write-Host "  a 127.0.0.1 HTTP transport, which policy cannot block." -ForegroundColor Yellow
     }
     elseif ($all -match "forbidden") {
-        Write-Host "  'Forbidden' — the manifest WAS found but the extension's origin" -ForegroundColor Yellow
+        Write-Host "  'Forbidden' - the manifest WAS found but the extension's origin" -ForegroundColor Yellow
         Write-Host "  is not in allowed_origins. Re-run install_native_host.ps1 with" -ForegroundColor Yellow
         Write-Host "  the ID shown on the extension's card." -ForegroundColor Yellow
     }
     elseif ($all -match "Failed to start") {
-        Write-Host "  'Failed to start' — manifest found, binary refused to launch." -ForegroundColor Yellow
+        Write-Host "  'Failed to start' - manifest found, binary refused to launch." -ForegroundColor Yellow
         Write-Host "  Check antivirus and application-control policy for the exe." -ForegroundColor Yellow
     }
     exit 0
 }
 
 # ---------------------------------------------------------------------------
-# Phase 1 — relaunch with logging
+# Phase 1 - relaunch with logging
 # ---------------------------------------------------------------------------
 if (-not (Test-Path $Config.Exe)) {
     Write-Host "ERROR: $Browser not found at $($Config.Exe)" -ForegroundColor Red

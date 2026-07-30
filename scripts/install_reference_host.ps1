@@ -1,11 +1,11 @@
-# Aegis — install the MINIMAL REFERENCE HOST (diagnostic only)
+# Aegis - install the MINIMAL REFERENCE HOST (diagnostic only)
 #
 # Installs a trivial Python native messaging host under the name
 # `com.aegis.echo`, alongside (not replacing) the real Aegis host.
 #
 # WHY: Edge has never launched the Aegis host. It reports "Can't find manifest"
 # for a manifest that exists at a path the registry points to, and the Aegis
-# binary — which logs on its very first statement — has never written a log.
+# binary - which logs on its very first statement - has never written a log.
 # Every part of the registration verifies correct when inspected directly.
 #
 # This partitions the problem:
@@ -69,7 +69,7 @@ Copy-Item $SrcPy (Join-Path $InstallDir "echo_host.py") -Force
 # --- .bat wrapper: makes Edge launch us through cmd.exe --------------------
 # This is deliberate. If Edge is failing to launch .exe hosts directly (there
 # is a documented Edge policy that toggles exactly this behaviour), a .bat host
-# would still work — and that difference is itself the diagnosis.
+# would still work - and that difference is itself the diagnosis.
 $BatPath = Join-Path $InstallDir "echo-host.bat"
 $bat = @"
 @echo off

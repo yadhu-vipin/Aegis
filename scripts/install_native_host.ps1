@@ -1,4 +1,4 @@
-# Aegis — Windows Native Messaging Host Installer
+# Aegis - Windows Native Messaging Host Installer
 # Registers com.aegis.sandbox as a Chrome Native Messaging host.
 #
 # Usage:
@@ -180,7 +180,7 @@ if ($firstBytes.Count -ge 3 -and $firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq
 Write-Host "  Wrote manifest (UTF-8, no BOM)" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------------------
-# Register in the Windows registry — for EVERY installed Chromium browser
+# Register in the Windows registry - for EVERY installed Chromium browser
 # ---------------------------------------------------------------------------
 # The key's DEFAULT value is the full path to the manifest. HKCU needs no admin.
 # Each browser reads only its own hive, so registering under Google\Chrome

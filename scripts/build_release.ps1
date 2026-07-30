@@ -1,4 +1,4 @@
-# Aegis — Release Build & Packaging Script
+# Aegis - Release Build & Packaging Script
 # Compiles aegis-host in release mode and packages shipping zip bundle.
 
 $ErrorActionPreference = "Stop"
@@ -27,4 +27,4 @@ Copy-Item "$RepoDir\scripts\install_native_host.ps1" "$DistDir\"
 
 Compress-Archive -Path "$DistDir\*" -DestinationPath "$RepoDir\aegis-v1.0.0-windows.zip" -Force
 
-Write-Host "✅ Release bundle created: $RepoDir\aegis-v1.0.0-windows.zip" -ForegroundColor Green
+Write-Host "OK Release bundle created: $RepoDir\aegis-v1.0.0-windows.zip" -ForegroundColor Green

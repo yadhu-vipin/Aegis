@@ -203,6 +203,48 @@ function probeNativeHost() {
   });
 }
 
+/**
+ * DIAGNOSTIC: probe the minimal reference host (`com.aegis.echo`).
+ *
+ * Aegis's own host has never been launched by Edge, despite a registration
+ * that verifies correct in every particular. This partitions the cause:
+ *
+ *   echo reachable, aegis not -> native messaging works; the fault is
+ *                                specific to the Aegis registration
+ *   neither reachable         -> native messaging is broken for this browser
+ *                                install; nothing in Aegis is at fault
+ *
+ * Install it with scripts\install_reference_host.ps1. If it is not installed
+ * this resolves to "not installed" and costs nothing.
+ */
+function probeReferenceHost() {
+  return new Promise((resolve) => {
+    let port, settled = false;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      try { port?.disconnect(); } catch { /* already gone */ }
+      resolve(r);
+    };
+    try {
+      port = chrome.runtime.connectNative("com.aegis.echo");
+    } catch (err) {
+      return done({ ok: false, error: err.message });
+    }
+    port.onMessage.addListener((msg) => {
+      if (msg.type === "ECHO_PONG") {
+        done({ ok: true, pid: msg.pid, python: msg.python });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      done({ ok: false, error: err ? err.message : "disconnected without replying" });
+    });
+    port.postMessage({ type: "HELLO" });
+    setTimeout(() => done({ ok: false, error: "no reply within 5s" }), 5000);
+  });
+}
+
 // Probe on every worker start so the popup always reflects current reality.
 probeNativeHost().then((h) => {
   if (!h.ok) {
@@ -400,7 +442,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message.type === "RECHECK_HEALTH") {
-    probeNativeHost().then(sendResponse);
+    // Probe both so the popup can say WHICH of the two failed. That
+    // distinction is the whole diagnosis.
+    Promise.all([probeNativeHost(), probeReferenceHost()])
+      .then(([aegis, echo]) => {
+        setHealth({ ...aegis, reference: echo });
+        sendResponse({ ...aegis, reference: echo });
+      })
+      .catch(() => sendResponse(null));
     return true;
   }
   if (message.type === "GET_ACTIVE_SESSIONS") {

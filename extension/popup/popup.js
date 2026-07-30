@@ -178,9 +178,30 @@ async function refreshHealth() {
     banner.hidden = false;
     banner.className = "health-banner bad";
     title.textContent = "Scanner unreachable — downloads will be blocked";
-    // Both the raw error and what to do about it: the raw string is what you
-    // search for, the advice is what you act on.
-    detail.textContent = `${h.error}\n\n${healthAdvice(h.error)}`;
+
+    let text = `${h.error}\n\n${healthAdvice(h.error)}`;
+
+    // The reference-host result is the diagnosis, so lead with it when we
+    // have one: it says whether native messaging works at all on this
+    // machine, which decides whether the fault is ours or the browser's.
+    if (h.reference) {
+      text += "\n\n── Diagnostic ──\n";
+      if (h.reference.ok) {
+        text +=
+          `Reference host (com.aegis.echo) WORKS — pid ${h.reference.pid}, ` +
+          `Python ${h.reference.python}.\n\n` +
+          `So native messaging is fine on this machine and the fault is ` +
+          `specific to the Aegis registration. Compare the two manifests in ` +
+          `C:\\Aegis\\.`;
+      } else {
+        text +=
+          `Reference host (com.aegis.echo) ALSO fails: ${h.reference.error}\n\n` +
+          `Two independent hosts — different language, different launcher, ` +
+          `different registry key — both fail. Native messaging is not ` +
+          `working in this browser at all. Nothing in Aegis is at fault.`;
+      }
+    }
+    detail.textContent = text;
   }
 }
 

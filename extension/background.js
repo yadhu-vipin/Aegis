@@ -45,8 +45,89 @@ const ML_SERVICE_URL = "http://127.0.0.1:8787/score";
  */
 const QUARANTINE_SUBDIR = "aegis_quarantine";
 
-/** downloadId -> session state */
+/**
+ * downloadId -> session state.
+ *
+ * MV3 service workers are terminated after roughly 30s idle, taking this Map
+ * with them. Anything relying on it alone silently loses the download: the
+ * onChanged handler finds no session, returns early, and the file is orphaned
+ * in quarantine with no verdict and no notification — the user simply never
+ * gets their file.
+ *
+ * So the Map is a cache over chrome.storage.session, which survives worker
+ * restarts (and, unlike storage.local, is cleared when the browser closes so
+ * we do not resurrect stale sessions days later). Port objects cannot be
+ * serialized, so they are deliberately excluded and re-established on restore.
+ */
 const activeSessions = new Map();
+
+const SESSION_STORE_KEY = "activeSessions";
+
+async function persistSessions() {
+  try {
+    const plain = {};
+    for (const [id, s] of activeSessions) {
+      const { port, ...rest } = s; // ports are not serializable
+      plain[id] = rest;
+    }
+    await chrome.storage.session.set({ [SESSION_STORE_KEY]: plain });
+  } catch (err) {
+    console.warn("[Aegis] could not persist sessions:", err);
+  }
+}
+
+/**
+ * Rebuild in-memory state after a service-worker restart and resume any
+ * download that was mid-scan.
+ */
+async function restoreSessions() {
+  let stored = {};
+  try {
+    ({ [SESSION_STORE_KEY]: stored = {} } = await chrome.storage.session.get(SESSION_STORE_KEY));
+  } catch {
+    return;
+  }
+
+  const ids = Object.keys(stored);
+  if (!ids.length) return;
+  console.log(`[Aegis] restoring ${ids.length} session(s) after worker restart`);
+
+  for (const idStr of ids) {
+    const id = Number(idStr);
+    const session = stored[idStr];
+
+    // Is this download still live? If Chrome has finished or dropped it while
+    // we were asleep, there is nothing to resume.
+    let items = [];
+    try {
+      items = await chrome.downloads.search({ id });
+    } catch { /* download record gone */ }
+
+    const item = items[0];
+    if (!item) {
+      activeSessions.delete(id);
+      continue;
+    }
+
+    if (item.state === "in_progress" || item.state === "complete") {
+      activeSessions.set(id, { ...session, port: null });
+      if (session.absolutePath) {
+        // Re-attach the host. Scanning restarts from offset 0, which is
+        // idempotent — worst case we re-read bytes we already checked.
+        beginWatch(id, activeSessions.get(id));
+      }
+    } else {
+      // interrupted/cancelled while we were asleep — nothing was delivered.
+      activeSessions.delete(id);
+    }
+  }
+  await persistSessions();
+}
+
+// Restore on every worker start-up, not just on install.
+restoreSessions();
+chrome.runtime.onStartup.addListener(restoreSessions);
+chrome.runtime.onInstalled.addListener(restoreSessions);
 
 // ---------------------------------------------------------------------------
 // Verdict history (for the popup)
@@ -279,6 +360,10 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
 
   console.log(`[Aegis] Redirecting "${originalFilename}" -> ${quarantineRelative}`);
 
+  // Persist immediately: if the worker is killed between here and onChanged,
+  // this is the only record that the download belongs to Aegis at all.
+  persistSessions();
+
   // "uniquify" so two concurrent downloads can never collide on one UUID.
   suggest({ filename: quarantineRelative, conflictAction: "uniquify" });
 });
@@ -294,6 +379,7 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (delta.filename && delta.filename.current && session.state === "pending") {
     session.absolutePath = delta.filename.current;
     session.state = "scanning";
+    persistSessions();
     beginWatch(delta.id, session);
   }
 
@@ -429,13 +515,22 @@ function failClosed(downloadId, session, reason) {
 
   notify({ blocked: true, filename: session.originalFilename, verdictText: verdict });
   setBadge("!", "#c0392b");
-  finishSession(downloadId);
+  finishSession(downloadId, session);
 }
 
-function finishSession(downloadId) {
-  const session = activeSessions.get(downloadId);
+/**
+ * Tear a session down.
+ *
+ * Takes the session object directly where the caller has it: looking it up by
+ * id alone would find nothing if it had already been removed, and the port
+ * would then leak instead of being disconnected.
+ */
+function finishSession(downloadId, knownSession) {
+  const session = knownSession || activeSessions.get(downloadId);
   if (session?.port) {
-    try { session.port.disconnect(); } catch { /* already gone */ }
+    try { session.port.disconnect(); } catch { /* already disconnected */ }
+    session.port = null;
   }
   activeSessions.delete(downloadId);
+  persistSessions();
 }

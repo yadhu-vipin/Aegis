@@ -225,7 +225,39 @@ function uuid() {
  * necessarily a subfolder of Downloads. The host moves cleared files up into
  * Downloads proper and deletes the rest.
  */
+/**
+ * Cached copy of the Layer 2 toggle.
+ *
+ * onDeterminingFilename must call suggest() synchronously to intercept, so we
+ * cannot await storage here — the value is mirrored into this variable and kept
+ * current via the storage change listener below.
+ *
+ * The popup has always shown this toggle; until now background.js ignored it,
+ * so switching it off did nothing. If Aegis is misbehaving the user needs a way
+ * to actually turn it off and still use their browser.
+ */
+let layer2Enabled = true;
+
+chrome.storage.local.get("layer2Enabled").then(({ layer2Enabled: v }) => {
+  layer2Enabled = v !== false;
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.layer2Enabled) {
+    layer2Enabled = changes.layer2Enabled.newValue !== false;
+    console.log(`[Aegis] Layer 2 ${layer2Enabled ? "enabled" : "DISABLED"}`);
+  }
+});
+
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
+  if (!layer2Enabled) {
+    // Explicitly disabled by the user. Do not intercept — let Chrome download
+    // normally. Logged so the state is never a silent surprise.
+    console.warn("[Aegis] Layer 2 disabled — download NOT scanned:", downloadItem.filename);
+    suggest();
+    return;
+  }
+
   const id = uuid();
   const quarantineRelative = `${QUARANTINE_SUBDIR}/${id}.aegispart`;
 

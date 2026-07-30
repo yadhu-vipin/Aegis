@@ -126,6 +126,44 @@ impl DownloadWatcher {
 #[cfg(windows)]
 const ERROR_VIRUS_INFECTED: i32 = 225;
 
+/// `ERROR_SHARING_VIOLATION` — another process (Chrome, writing the download)
+/// holds the file with a share mode that excludes us right now.
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+/// `ERROR_LOCK_VIOLATION` — a byte-range lock is held on the region.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Is this error transient — i.e. "the writer is busy, try again shortly" —
+/// rather than a real failure?
+///
+/// This matters enormously in the real deployment: Chrome has the `.crdownload`
+/// file open for writing for the entire duration of the download. Treating a
+/// momentary sharing violation as fatal takes down the host, which disconnects
+/// the native port, which makes the extension fail closed and cancel a
+/// perfectly good download. The symptom is "nothing can be downloaded at all",
+/// with the cause several layers away from where it surfaces.
+fn is_transient_io(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::NotFound
+        || e.kind() == std::io::ErrorKind::PermissionDenied
+        || e.kind() == std::io::ErrorKind::Interrupted
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Result of one scanning pass.
 enum ScanStep {
     /// Bytes newly scanned this pass (0 is normal — the writer may be slow).
@@ -145,10 +183,6 @@ impl DownloadWatcher {
 
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
-            // A rename can race us between exists() and open(); treat as "wait".
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ScanStep::Scanned(0))
-            }
             // Defender (or another AV) got there first. This is a BLOCK, not an
             // error: the file is gone and the user is protected. It happens for
             // signature-known malware, where the on-write scanner beats us to
@@ -162,16 +196,28 @@ impl DownloadWatcher {
                     path.display()
                 )));
             }
+            // Chrome still has the file open, or a rename raced us between
+            // exists() and open(). Wait and retry — NOT fatal.
+            Err(ref e) if is_transient_io(e) => {
+                tracing::trace!(
+                    path = %path.display(),
+                    error = %e,
+                    "transient IO while opening download; will retry"
+                );
+                return Ok(ScanStep::Scanned(0));
+            }
             Err(e) => {
                 return Err(e).with_context(|| format!("open quarantine file {}", path.display()))
             }
         };
 
-        let len = file
-            .metadata()
-            .await
-            .with_context(|| format!("stat quarantine file {}", path.display()))?
-            .len();
+        let len = match file.metadata().await {
+            Ok(m) => m.len(),
+            Err(ref e) if is_transient_io(e) => return Ok(ScanStep::Scanned(0)),
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat quarantine file {}", path.display()))
+            }
+        };
 
         if len <= self.offset {
             return Ok(ScanStep::Scanned(0));
@@ -186,10 +232,12 @@ impl DownloadWatcher {
 
         while self.offset < len {
             let want = std::cmp::min(cfg.chunking.chunk_size as u64, len - self.offset) as usize;
-            let n = file
-                .read(&mut buf[..want])
-                .await
-                .context("read span from quarantine file")?;
+            let n = match file.read(&mut buf[..want]).await {
+                Ok(n) => n,
+                // Partial write in progress — come back for it next pass.
+                Err(ref e) if is_transient_io(e) => break,
+                Err(e) => return Err(e).context("read span from quarantine file"),
+            };
             if n == 0 {
                 break; // writer hasn't flushed yet
             }
@@ -495,6 +543,54 @@ mod tests {
                 assert!(reason.contains("stalled"), "unexpected block reason: {reason}");
             }
             WatchEvent::Completed(_) => panic!("a stalled download must not be completed"),
+        }
+    }
+
+    /// Chrome holds the `.crdownload` file open for the whole download. If that
+    /// makes our open fail and we treat it as fatal, the error propagates out of
+    /// `watch_download`, ends `run()`, exits the host, drops the native port —
+    /// and the extension correctly reads a dropped port as "cannot verify" and
+    /// cancels the download. The visible symptom is "nothing downloads at all",
+    /// several layers from the cause.
+    ///
+    /// So: a locked file must NEVER produce an `Err` from `watch_download`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exclusive_lock_does_not_kill_the_watcher() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("locked.aegispart");
+        let partial = dir.path().join("locked.aegispart.crdownload");
+        std::fs::write(&partial, b"some downloaded bytes").unwrap();
+
+        // share_mode(0) == no sharing at all: any other open fails with
+        // ERROR_SHARING_VIOLATION (32). This is the worst case Chrome could
+        // present us with.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&partial)
+            .expect("take exclusive lock");
+
+        let mut cfg = test_config();
+        cfg.chunking.per_chunk_timeout_secs = 1;
+
+        let mut w = DownloadWatcher::new(WatchTarget::new(&final_path), "doc.pdf");
+        let result = watch_download(&mut w, &cfg, |_, _| {}).await;
+
+        let event = result.expect(
+            "a locked download file must not produce an Err — that kills the host \
+             and makes every download fail",
+        );
+        match event {
+            // Correct: we waited, could not read, and gave up safely.
+            WatchEvent::EarlyBlock { reason, .. } => {
+                assert!(reason.contains("stalled"), "unexpected reason: {reason}");
+            }
+            WatchEvent::Completed(_) => {
+                panic!("an unreadable file must not be reported as successfully scanned")
+            }
         }
     }
 

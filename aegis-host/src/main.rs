@@ -31,15 +31,66 @@ use std::collections::VecDeque;
 use tokio::io::AsyncWriteExt;
 use tracing::Level;
 
+/// Fan log output to both stderr and the log file.
+struct MultiWriter<A: std::io::Write, B: std::io::Write>(A, B);
+
+impl<A: std::io::Write, B: std::io::Write> std::io::Write for MultiWriter<A, B> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Best-effort on both; a failing log sink must never break scanning.
+        let _ = self.0.write_all(buf);
+        let _ = self.1.write_all(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.0.flush();
+        let _ = self.1.flush();
+        Ok(())
+    }
+}
+
+/// Open the on-disk log, next to the binary.
+///
+/// When Chrome spawns a native messaging host it swallows the host's stderr,
+/// so stderr-only logging leaves no way to diagnose anything that happens in
+/// the real deployment — which is the only place most of this code runs.
+/// Appending to a file next to the binary is the difference between "downloads
+/// mysteriously fail" and an actual diagnosis.
+fn open_log_file() -> Option<std::fs::File> {
+    let path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("aegis-host.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 #[tokio::main]
 async fn main() {
-    // Bootstrap logging to stderr (stdout is the native messaging channel)
+    // NEVER stdout — that is the native messaging frame channel, and a single
+    // stray byte there desynchronises the length prefix and breaks the protocol.
+    let log_file = open_log_file();
     let subscriber = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .with_max_level(Level::DEBUG)
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            match log_file.as_ref().and_then(|f| f.try_clone().ok()) {
+                Some(f) => Box::new(MultiWriter(std::io::stderr(), f)),
+                None => Box::new(std::io::stderr()),
+            }
+        })
         .finish();
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set tracing subscriber");
+
+    tracing::info!(
+        pid = std::process::id(),
+        exe = ?std::env::current_exe().ok(),
+        cwd = ?std::env::current_dir().ok(),
+        "=== aegis-host starting ==="
+    );
 
     if let Err(e) = run().await {
         tracing::error!("Fatal error: {:?}", e);
@@ -82,7 +133,25 @@ async fn run() -> Result<()> {
 
         match msg_type.as_str() {
             "WATCH_BEGIN" => {
-                handle_watch_session(&msg, &cfg, &sandbox).await?;
+                // Contain failures to this one download. Propagating here would
+                // end run(), exit the process, and drop the native port — which
+                // the extension correctly reads as "cannot verify" and turns
+                // into a cancelled download. One unlucky file must not take the
+                // host down and block every subsequent download.
+                let sid = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                if let Err(e) = handle_watch_session(&msg, &cfg, &sandbox).await {
+                    tracing::error!(session = %sid, error = ?e, "watch session failed");
+                    // Fail closed: no verdict means no release.
+                    native_messaging::send_verdict(
+                        "BLOCKED",
+                        &format!("Not released: scanning failed ({e:#})"),
+                        Some(&sid),
+                    )?;
+                }
             }
             "START_DOWNLOAD" => {
                 handle_download_session(&msg, &cfg, &quarantine, &sandbox).await?;

@@ -245,18 +245,50 @@ function probeReferenceHost() {
   });
 }
 
-// Probe on every worker start so the popup always reflects current reality.
-probeNativeHost().then((h) => {
-  if (!h.ok) {
-    console.error(
-      `[Aegis] NATIVE HOST UNREACHABLE (${h.stage}): ${h.error}\n` +
-      `  Downloads will be BLOCKED while this is true, because Aegis cannot ` +
-      `verify them.\n  Run scripts\\verify_native_host.ps1 to diagnose, or turn ` +
-      `off Layer 2 in the popup to browse normally.`
-    );
-    setBadge("?", "#f59e0b");
+/**
+ * Probe on every worker start so the popup reflects current reality without
+ * the user having to press anything.
+ *
+ * When the Aegis host fails we ALSO probe the reference host, because that
+ * comparison is the entire diagnosis — and requiring a button click to obtain
+ * it meant the popup showed the failure with no explanation of which side was
+ * at fault, which is exactly as useless as no diagnostic at all.
+ */
+async function runHealthProbes() {
+  const aegis = await probeNativeHost();
+
+  if (aegis.ok) {
+    await setHealth(aegis);
+    return;
   }
-});
+
+  // Aegis host is unreachable. Is native messaging working at all?
+  const reference = await probeReferenceHost();
+  await setHealth({ ...aegis, reference });
+
+  console.error(
+    `[Aegis] NATIVE HOST UNREACHABLE (${aegis.stage}): ${aegis.error}\n` +
+    `  Downloads will be BLOCKED while this is true, because Aegis cannot verify them.`
+  );
+  if (reference.ok) {
+    console.error(
+      `[Aegis] DIAGNOSIS: the reference host (com.aegis.echo) WORKS ` +
+      `(pid ${reference.pid}, Python ${reference.python}).\n` +
+      `  Native messaging is fine on this machine — the fault is specific to ` +
+      `the Aegis registration. Compare the two manifests in C:\\Aegis\\.`
+    );
+  } else {
+    console.error(
+      `[Aegis] DIAGNOSIS: the reference host ALSO fails: ${reference.error}\n` +
+      `  Two independent hosts (different language, launcher and registry key) ` +
+      `both refused. Native messaging is not working in this browser at all — ` +
+      `nothing in Aegis is at fault.`
+    );
+  }
+  setBadge("?", "#f59e0b");
+}
+
+runHealthProbes();
 
 // ---------------------------------------------------------------------------
 // Verdict history (for the popup)

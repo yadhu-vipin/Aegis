@@ -200,6 +200,14 @@ async function refreshHealth() {
           `different registry key — both fail. Native messaging is not ` +
           `working in this browser at all. Nothing in Aegis is at fault.`;
       }
+    } else {
+      // Never leave the diagnostic silently absent — that reads as "the
+      // feature isn't there" rather than "it hasn't run yet".
+      text +=
+        "\n\n── Diagnostic ──\n" +
+        "Reference-host comparison not run yet. Press Re-check below.\n" +
+        "If it still doesn't appear, the reference host isn't installed — run " +
+        "scripts\\install_reference_host.ps1.";
     }
     detail.textContent = text;
   }

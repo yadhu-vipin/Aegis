@@ -380,6 +380,93 @@ fn quarantine_subdir_matches_config() {
     );
 }
 
+/// Chromium does NOT honour the extension we suggest.
+///
+/// `background.js` asks for `{uuid}.aegispart`, but Chromium re-applies its own
+/// extension from the response MIME type, so a PDF lands on disk as
+/// `{uuid}.pdf`. The host used to require a `.aegispart` suffix and therefore
+/// rejected every real download as malformed — while working perfectly:
+///
+///   Redirecting "notes.pdf" -> aegis_quarantine/4a635126-....aegispart
+///   REJECTED: quarantine filename "4a635126-....pdf" is not a .aegispart file
+///
+/// Nothing in the extension or the host looked wrong in isolation; the two
+/// simply disagreed about a filename the browser had silently rewritten.
+#[test]
+fn quarantine_file_is_accepted_whatever_extension_chrome_picks() {
+    let downloads = dirs_downloads();
+    let quarantine = downloads.join("aegis_quarantine");
+    if std::fs::create_dir_all(&quarantine).is_err() {
+        return; // no Downloads dir in this environment; nothing to assert
+    }
+
+    // The extensions Chromium realistically substitutes, plus the uniquify
+    // suffix it adds on collision.
+    for name in [
+        "550e8400-e29b-41d4-a716-446655440000.pdf",
+        "550e8400-e29b-41d4-a716-446655440000.aegispart",
+        "550e8400-e29b-41d4-a716-446655440000.exe",
+        "550e8400-e29b-41d4-a716-446655440000.tar.gz",
+        "550e8400-e29b-41d4-a716-446655440000 (1).pdf",
+    ] {
+        let path = quarantine.join(name);
+        std::fs::write(&path, b"x").ok();
+
+        let sid = format!("t-{}", name.len());
+        let mut input = frame(&serde_json::json!({
+            "type": "WATCH_BEGIN",
+            "session_id": sid,
+            "quarantine_path": path.to_string_lossy(),
+            "original_filename": "notes.pdf",
+        }));
+        input.extend(frame(&serde_json::json!({ "type": "PING" })));
+
+        let (frames, stderr) = run_host(&input);
+        let rejected = frames.iter().any(|f| {
+            f.get("status").and_then(|s| s.as_str()) == Some("REJECTED_MALFORMED")
+                && f.get("verdict")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v.contains("UUID") || v.contains("aegispart"))
+        });
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !rejected,
+            "host rejected its own quarantine file {name:?} on filename grounds. \
+             Chromium chooses the extension, not us. frames={frames:?} stderr={stderr}"
+        );
+    }
+}
+
+/// A path outside the quarantine root must still be refused — the containment
+/// check is the actual security property and must survive the relaxation above.
+#[test]
+fn path_outside_quarantine_root_is_still_rejected() {
+    let input = frame(&serde_json::json!({
+        "type": "WATCH_BEGIN",
+        "session_id": "t-escape",
+        "quarantine_path": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+        "original_filename": "hosts",
+    }));
+    let (frames, _) = run_host(&input);
+    let v = verdicts(&frames);
+    assert!(!v.is_empty(), "expected a rejection");
+    assert_eq!(
+        status_of(v[0]),
+        "REJECTED_MALFORMED",
+        "a path outside the quarantine root must be refused: {:?}",
+        v[0]
+    );
+}
+
+fn dirs_downloads() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join("Downloads")
+}
+
 /// A message with no `type` field at all.
 #[test]
 fn missing_type_field_is_rejected() {

@@ -55,23 +55,43 @@ impl<A: std::io::Write, B: std::io::Write> std::io::Write for MultiWriter<A, B> 
 /// the real deployment — which is the only place most of this code runs.
 /// Appending to a file next to the binary is the difference between "downloads
 /// mysteriously fail" and an actual diagnosis.
-fn open_log_file() -> Option<std::fs::File> {
-    let path = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("aegis-host.log");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+fn open_log_file() -> Option<(std::fs::File, std::path::PathBuf)> {
+    // Try next to the binary first, then the temp directory.
+    //
+    // The fallback is not paranoia: when Edge spawned this host it was
+    // observed to run, return a verdict, and write NO log — meaning it could
+    // not create a file beside its own executable, even though the same
+    // binary can when launched from a shell. Whatever restricts that (token,
+    // integrity level, container), %TEMP% is writable by anything that can
+    // run at all. Without a log there is no way to see what the host did in
+    // the only environment that matters.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("aegis-host.log"));
+        }
+    }
+    candidates.push(std::env::temp_dir().join("aegis-host.log"));
+
+    for path in candidates {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            return Some((f, path));
+        }
+    }
+    None
 }
 
 #[tokio::main]
 async fn main() {
     // NEVER stdout — that is the native messaging frame channel, and a single
     // stray byte there desynchronises the length prefix and breaks the protocol.
-    let log_file = open_log_file();
+    let opened = open_log_file();
+    let log_path = opened.as_ref().map(|(_, p)| p.clone());
+    let log_file = opened.map(|(f, _)| f);
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(Level::DEBUG)
@@ -85,10 +105,18 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set tracing subscriber");
 
+    // Record who we are and what we can see. When this host misbehaves it is
+    // almost always because the environment differs from a shell launch, so
+    // capture that difference up front rather than inferring it later.
     tracing::info!(
         pid = std::process::id(),
         exe = ?std::env::current_exe().ok(),
         cwd = ?std::env::current_dir().ok(),
+        log = ?log_path,
+        user = ?std::env::var("USERNAME").ok(),
+        localappdata = ?std::env::var("LOCALAPPDATA").ok(),
+        temp = ?std::env::var("TEMP").ok(),
+        args = ?std::env::args().collect::<Vec<_>>(),
         "=== aegis-host starting ==="
     );
 
@@ -233,12 +261,37 @@ fn validate_quarantine_path(
     let file_name = claimed_path
         .file_name()
         .context("quarantine path has no filename component")?;
-
-    // Reject anything that is not the extension we hand out — a further guard
-    // against being pointed at an unrelated pre-existing file in the directory.
     let name_str = file_name.to_string_lossy();
-    if !name_str.ends_with(".aegispart") {
-        anyhow::bail!("REJECTED: quarantine filename {name_str:?} is not a .aegispart file");
+
+    // Guard against being pointed at an unrelated pre-existing file in the
+    // directory by requiring the stem to be a UUID we could have issued.
+    //
+    // Do NOT check the extension. The extension suggests `{uuid}.aegispart`,
+    // but Chromium re-applies its own extension from the response MIME type,
+    // so a PDF actually lands as `{uuid}.pdf`. Requiring `.aegispart` rejected
+    // every real download — the host was running correctly and refusing its
+    // own quarantine files:
+    //
+    //   Redirecting "notes.pdf" -> aegis_quarantine/4a635126-....aegispart
+    //   REJECTED: quarantine filename "4a635126-....pdf" is not a .aegispart file
+    //
+    // The security property comes from the canonicalized root containment
+    // above; the UUID stem is defence in depth, and unlike the extension it is
+    // something we control end to end.
+    let stem = name_str.split('.').next().unwrap_or("");
+
+    // `conflictAction: "uniquify"` can append " (1)", " (2)" on collision.
+    let stem = stem
+        .rsplit_once(" (")
+        .filter(|(_, tail)| tail.ends_with(')') && tail[..tail.len() - 1].chars().all(|c| c.is_ascii_digit()))
+        .map(|(head, _)| head)
+        .unwrap_or(stem);
+
+    if uuid::Uuid::parse_str(stem).is_err() {
+        anyhow::bail!(
+            "REJECTED: quarantine filename {name_str:?} does not start with a UUID \
+             issued by Aegis"
+        );
     }
 
     Ok(parent.join(file_name))

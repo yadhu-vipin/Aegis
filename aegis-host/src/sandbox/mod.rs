@@ -1,13 +1,18 @@
 //! Platform-agnostic sandbox trait and shared types.
 //!
-//! On Windows: `PlatformSandbox` = `HcsSandbox` (real HCS detonation).
+//! On Windows: `PlatformSandbox` = `RestrictedSandbox` (restricted token, Low
+//! integrity, Job Object, isolated desktop — see `windows_restricted`).
 //! On Unix/Linux: `PlatformSandbox` = `StubSandbox` (dev-mode no-op, logs intent).
+//!
+//! The HCS backend was removed: it requires the Host Compute Service, which is
+//! unavailable on Windows Home (no `vmcompute` service, and Hyper-V /
+//! Containers / VirtualMachinePlatform are all absent on that edition).
 
 #![allow(dead_code)]
 
 pub mod linux_stub;
 #[cfg(windows)]
-pub mod windows_hcs;
+pub mod windows_restricted;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -52,6 +57,16 @@ pub trait Sandbox: Send + Sync {
 
 // Platform selection at compile time.
 #[cfg(windows)]
-pub use windows_hcs::HcsSandbox as PlatformSandbox;
+pub use windows_restricted::RestrictedSandbox as PlatformSandbox;
 #[cfg(unix)]
 pub use linux_stub::StubSandbox as PlatformSandbox;
+
+/// Construct the sandbox backend for this platform.
+///
+/// Both backends are unit structs today, but callers must go through this
+/// constructor rather than naming the type as a value — that is what broke the
+/// Windows build previously (`let sandbox = PlatformSandbox;` only compiles
+/// while every backend happens to be a unit struct).
+pub fn platform_sandbox() -> PlatformSandbox {
+    PlatformSandbox::new()
+}

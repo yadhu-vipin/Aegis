@@ -22,6 +22,11 @@ block_threshold = 0.85
 chunk_size = 262144
 # How many chunks to keep in ring buffer for cross-chunk intent scanning
 ring_buffer_chunks = 4
+# Hard ceiling on a single download, in bytes (8 GB default).
+# Enforced continuously as chunks arrive, not just up front: without this a
+# download with no Content-Length can write past whatever the disk-space guard
+# reserved and fill the quarantine volume.
+max_download_bytes = 8589934592
 # Per-chunk read timeout in seconds
 per_chunk_timeout_secs = 30
 # Total transfer timeout in seconds (1 hour)

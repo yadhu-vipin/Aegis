@@ -52,7 +52,7 @@ async fn run() -> Result<()> {
     tracing::info!("Aegis host started. Config loaded.");
 
     let quarantine = Quarantine::new(&cfg.quarantine.subdir)?;
-    let sandbox = PlatformSandbox;
+    let sandbox = sandbox::platform_sandbox();
 
     // Main message loop — process one session per invocation (Chrome spawns
     // a new host process per port.connectNative() call).
@@ -151,13 +151,30 @@ async fn handle_download_session(
     let mut cumulative_descriptions: Vec<String> = Vec::new();
     let mut is_first_chunk = true;
     let mut total_bytes: u64 = 0;
+    // Next sequence number we will accept. Chunks must arrive in order,
+    // starting at 0, with no gaps, duplicates, or replays.
+    let mut expected_seq: u64 = 0;
+    // Set ONLY on receipt of a chunk with is_last=true. Any other way out of
+    // the loop means we did not see the whole file.
+    let mut transfer_completed = false;
 
     // --- Chunk loop ---
     loop {
         let chunk_msg = match native_messaging::read_message()? {
             Some(m) => m,
             None => {
-                tracing::warn!("Pipe closed mid-session {}", session_id);
+                // FAIL CLOSED: the pipe closed before is_last. We have a
+                // truncated file. Previously this `break` fell through to the
+                // verdict logic, which scored the partial bytes — and a
+                // truncated file scores low, so it was RELEASED. That made
+                // "send one benign chunk, then disconnect" a reliable way to
+                // get an unscanned file cleared.
+                tracing::warn!(
+                    session = %session_id,
+                    bytes_received = total_bytes,
+                    chunks_received = expected_seq,
+                    "Pipe closed mid-transfer — treating as incomplete, blocking"
+                );
                 break;
             }
         };
@@ -191,6 +208,28 @@ async fn handle_download_session(
                 return Ok(());
             }
         };
+
+        // Enforce strict ordering. Previously `seq` was parsed and echoed back
+        // in the ack but never checked, so out-of-order, duplicate, and
+        // replayed chunks were all accepted and written in arrival order —
+        // meaning an attacker controlled the byte layout of the quarantined
+        // file relative to what the scanner saw. Spec §4 requires rejection.
+        if seq != expected_seq {
+            tracing::warn!(
+                session = %session_id,
+                expected = expected_seq,
+                got = seq,
+                "Out-of-order chunk sequence — rejecting session"
+            );
+            native_messaging::send_verdict(
+                "REJECTED_MALFORMED",
+                &format!("Out-of-order chunk: expected seq {expected_seq}, got {seq}"),
+                Some(&session_id),
+            )?;
+            quarantine.delete_file(&quarantine_path);
+            return Ok(());
+        }
+        expected_seq = expected_seq.saturating_add(1);
 
         let is_last = chunk_msg.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -238,6 +277,29 @@ async fn handle_download_session(
 
         total_bytes = total_bytes.saturating_add(chunk_bytes.len() as u64);
 
+        // Continuous size ceiling. The up-front disk-space guard reserves based
+        // on Content-Length, or on a default when it is absent — but nothing
+        // forced the actual transfer to stay within that reservation, so a
+        // length-less download could write until the volume filled.
+        if total_bytes > cfg.chunking.max_download_bytes {
+            tracing::warn!(
+                session = %session_id,
+                total_bytes,
+                limit = cfg.chunking.max_download_bytes,
+                "Download exceeded max_download_bytes — rejecting"
+            );
+            native_messaging::send_verdict(
+                "REJECTED_TOO_LARGE",
+                &format!(
+                    "Download exceeded maximum allowed size ({} bytes > {} limit)",
+                    total_bytes, cfg.chunking.max_download_bytes
+                ),
+                Some(&session_id),
+            )?;
+            quarantine.delete_file(&quarantine_path);
+            return Ok(());
+        }
+
         // Build context prefix from tail of ring buffer
         let context_prefix: Option<Vec<u8>> = if ring.is_empty() {
             None
@@ -277,6 +339,7 @@ async fn handle_download_session(
         native_messaging::send_chunk_ack(&session_id, seq)?;
 
         if is_last {
+            transfer_completed = true;
             break;
         }
     }
@@ -284,6 +347,24 @@ async fn handle_download_session(
     // Flush quarantine file
     quarantine_file.flush().await?;
     drop(quarantine_file);
+
+    // FAIL CLOSED on a truncated transfer. We never saw is_last, so we scanned
+    // a prefix of the file and know nothing about the rest. A partial file
+    // scores low precisely because the interesting bytes have not arrived.
+    if !transfer_completed {
+        quarantine.delete_file(&quarantine_path);
+        native_messaging::send_verdict(
+            "BLOCKED",
+            &format!(
+                "Transfer incomplete: connection closed after {} bytes across {} chunks \
+                 without an end-of-stream marker. Not released — a partial file cannot be \
+                 cleared.",
+                total_bytes, expected_seq
+            ),
+            Some(&session_id),
+        )?;
+        return Ok(());
+    }
 
     // --- Aggregate risk ---
     let aggregate_risk = risk::aggregate_risk(&chunk_scores);
@@ -342,7 +423,6 @@ async fn handle_download_session(
                     Ok(report) => {
                         let final_decision = risk::decide_after_sandbox(&report.verdict);
                         if final_decision == Decision::Release {
-                            // Move file to safe location or notify extension to resume
                             native_messaging::send_verdict(
                                 "COMPLETE",
                                 &format!(
@@ -351,6 +431,11 @@ async fn handle_download_session(
                                 ),
                                 Some(&session_id),
                             )?;
+                            // Delete the quarantine copy. This path previously
+                            // leaked it — the pre-sandbox Release path deletes,
+                            // this one did not. Spec §4 requires deletion once a
+                            // verdict is reached.
+                            quarantine.delete_file(&quarantine_path);
                         } else {
                             quarantine.delete_file(&quarantine_path);
                             native_messaging::send_verdict(
@@ -389,8 +474,20 @@ async fn handle_download_session(
         }
 
         Decision::TooLargeToSandbox => {
-            // Should not reach here from decide() — handled in Sandbox branch above
-            unreachable!()
+            // `decide()` does not currently return this variant (the size check
+            // lives in the Sandbox branch above), but a panic here would take
+            // down the host and stop protecting the user — spec §4 forbids
+            // panics on any path. Fail closed instead.
+            tracing::error!(
+                session = %session_id,
+                "decide() returned TooLargeToSandbox unexpectedly — blocking (fail closed)"
+            );
+            quarantine.delete_file(&quarantine_path);
+            native_messaging::send_verdict(
+                "BLOCKED",
+                "Internal decision error — file not released (fail closed)",
+                Some(&session_id),
+            )?;
         }
     }
 

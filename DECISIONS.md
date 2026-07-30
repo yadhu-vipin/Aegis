@@ -107,6 +107,133 @@ default.
 
 ---
 
+## HCS Removed Entirely (supersedes the Phase 4 HCS decision below)
+
+**Finding:** this machine is Windows 11 **Home** Single Language. `vmcompute.exe`
+is absent and `Microsoft-Hyper-V-All`, `Containers`, `VirtualMachinePlatform`
+all report `NOT AVAILABLE ON THIS EDITION`. HCS cannot run here at all, and
+enabling it requires a paid upgrade to Pro.
+
+`ComputeCore.dll` *is* present, which is why the code appeared plausible — it
+would have linked and then failed at runtime against a service that does not
+exist.
+
+The HCS code was also wrong independently of that. Verified against Microsoft's
+API and schema reference, then confirmed by the compiler:
+- `HcsCreateComputeSystem` takes **5** parameters (id, configuration,
+  `HCS_OPERATION`, security descriptor, out-param). The code passed 3 and treated
+  the return value as the compute system. → `E0061`, `E0308`.
+- The API is **asynchronous**: `S_OK` means only that the operation *started*.
+  Callers must create an operation with `HcsCreateOperation` and wait via
+  `HcsWaitForOperationResult`. The code did neither.
+- The config JSON set no `Container` / `VirtualMachine` / `HostedSystem`
+  property, which the schema requires as mutually exclusive and mandatory. It
+  put `GuestOs` / `Storage` / `Networking` / `Processor` / `Memory` at the top
+  level, where they are all `Container` sub-fields.
+- `Storage.ScratchVhd`, `CreateInstead` and `SizeInGB` are **not real schema
+  fields**. `Storage` has exactly `Layers`, `Path`, `QoS`. So the "ephemeral
+  VHDX diff disk" hardening requirement was never actually implemented — the
+  `remove_file(&scratch_vhd)` cleanup deleted a file that was never created.
+- The sample was never executed: no `HcsCreateProcess` call anywhere.
+- **Fail-open verdict:** `HcsTerminateComputeSystem` returning `Err` mapped to
+  `Verdict::Clean`, and `decide_after_sandbox()` maps `Clean -> Release`. Any
+  HCS API failure released the file.
+
+**Decision:** delete `sandbox/windows_hcs.rs` and drop the
+`Win32_System_HostComputeSystem` Cargo feature. Detonation becomes
+`sandbox/windows_restricted.rs` — restricted token, Low integrity, Job Object,
+isolated desktop — which works on Home. Phase 1 ships it as a fail-closed stub
+returning `Suspicious`; real isolation lands in Phase 4.
+
+**Honest limitation to carry into the docs:** a restricted process shares the
+kernel. It contains commodity malware but does not stop a kernel exploit or a
+sandbox-escape chain, and sandbox-aware malware can simply behave while watched.
+This is a weaker boundary than a VM and `ARCHITECTURE.md` must say so plainly.
+Consequence: the strongest protection in this build is the streaming static
+analysis plus the quarantine broker, not the detonation stage.
+
+---
+
+## Hardening Pass — Findings and Status
+
+**FIXED in Phase 1:**
+
+1. **Truncation attack** (`main.rs`) — a mid-transfer pipe close `break`ed and
+   then scored the *partial* file. Truncated files score low, so "send one
+   benign chunk, then disconnect" reliably produced a `COMPLETE` verdict. Now
+   tracked by a `transfer_completed` flag set only on `is_last`; anything else
+   BLOCKS. **Fail-closed policy call.**
+2. **Sequence numbers unvalidated** (`main.rs`) — `seq` was parsed and echoed in
+   the ack but never checked, so out-of-order, duplicate, and replayed chunks
+   were accepted and written in arrival order, letting an attacker control the
+   byte layout of the quarantined file relative to what was scanned. Now
+   enforced strictly against `expected_seq` starting at 0.
+3. **Unbounded disk write** (`main.rs`) — `total_bytes` was accumulated but never
+   checked. With no `Content-Length` the guard reserved ~25.6 MB and then
+   accepted unlimited chunks. Added `chunking.max_download_bytes` (default 8 GB),
+   enforced continuously inside the loop, validated at config load.
+4. **Quarantine leak** (`main.rs`) — the post-sandbox `Release` path never deleted
+   the quarantine file. Now deletes, matching the pre-sandbox path.
+5. **Windows ACL never applied** (`quarantine.rs`) — previously a warning log only.
+   Now applied via `icacls` with an argument array (no shell interpolation, per
+   §4): inheritance stripped, single-principal full control. **FAIL CLOSED —
+   host startup aborts if the quarantine directory cannot be secured**, on the
+   grounds that scanning samples an attacker could swap underneath us is worse
+   than not starting. Verified on disk: the directory carries exactly one ACE.
+6. **`unreachable!()` panic landmine** (`main.rs`) — replaced with a fail-closed
+   BLOCK branch. §4 forbids panics on any path; a panic in a security tool is an
+   availability failure.
+7. **`f_bavail * f_bsize`** (`quarantine.rs`) — POSIX defines `f_bavail` in units
+   of `f_frsize`. Corrected, and the multiply is now `checked_mul`.
+8. **Dead code in `sanitize_filename`** (`quarantine.rs`) — separators were
+   filtered *before* the basename split, making the split dead and turning
+   `a/b/evil.exe` into `abevil.exe` rather than `evil.exe`. Order corrected;
+   `..` now collapses to `_` instead of discarding the whole name. Six unit
+   tests added.
+9. **Unused imports** — `ULARGE_INTEGER` (a real `E0432` compile error, not just
+   a lint) and the three unused HCS imports (removed with the file).
+
+**STILL OPEN — carried into later phases:**
+
+10. **TOCTOU on release** (Phase 2) — `Decision::Release` deletes the quarantine
+    copy and lets the extension perform the real download, so the bytes scanned
+    and the bytes delivered are two separate fetches. The Phase 2 re-architecture
+    removes this by having Chrome download straight into quarantine.
+11. **UTF-16 blindness** (Phase 3) — `intent.rs` runs `from_utf8_lossy` over raw
+    bytes, but PE files store API names as UTF-16LE, so `CreateRemoteThread`
+    decodes to `C<FFFD>r<FFFD>e...` and never matches. The red-flag table is
+    mostly WinAPI names, so the scanner is largely blind to what it targets.
+12. **Ring buffer over-retention** (Phase 2) — retains `ring_buffer_chunks` full
+    chunks (1 MB) but only the last 256 bytes of the newest are ever read.
+13. **`aggregate_result` discards booleans** (Phase 3) — `..Default::default()`
+    resets `header_valid` / `extension_mismatch` / `dangerous_intent`. Works only
+    because `decide()` reads `risk_score` alone; fragile if that changes.
+
+---
+
+## Native Host Registration (Phase 1)
+
+**Finding:** `install_native_host.ps1` registered
+`allowed_origins: ["chrome-extension://aegisdownloadguardextensionid/"]`. Chrome
+extension IDs are exactly 32 characters from `a`–`p`; that placeholder is 29
+characters and contains `r`,`s`,`t`,`u`,`w`,`x`,`z`. It could never match a real
+extension, so `connectNative()` would fail **silently** — no error, just nothing.
+
+**Decision:** the script now takes `-ExtensionId`, validates it against
+`^[a-p]{32}$`, and auto-detects from Chrome's `Preferences` by matching the
+unpacked extension path when not supplied. It **refuses to install** with an
+invalid ID rather than registering something that cannot work.
+
+Also: the manifest is now written with `UTF8Encoding($false)` and verified
+BOM-free. PowerShell 5.1's `Set-Content -Encoding UTF8` emits a BOM, which
+Chrome's manifest parser can reject — another silent-failure mode.
+
+The registry path `HKCU:\Software\Google\Chrome\NativeMessagingHosts\<name>` was
+already correct (verified against Chrome's native messaging documentation); the
+script now reads the value back after writing rather than assuming it took.
+
+---
+
 ## Existing Code Migration Decision
 
 The original `aegis/` directory (with `hcs.rs`, `scanner.rs`, `main.rs`) is

@@ -51,6 +51,10 @@ pub struct ChunkingConfig {
     pub ring_buffer_chunks: usize,
     pub per_chunk_timeout_secs: u64,
     pub total_transfer_timeout_secs: u64,
+    /// Hard ceiling on a single download, enforced continuously as chunks
+    /// arrive. Without it, a download with no Content-Length can write past
+    /// whatever the disk-space guard reserved.
+    pub max_download_bytes: u64,
 }
 
 impl ChunkingConfig {
@@ -154,6 +158,17 @@ impl Config {
         }
         if self.chunking.ring_buffer_chunks == 0 {
             anyhow::bail!("chunking.ring_buffer_chunks must be > 0");
+        }
+        if self.chunking.max_download_bytes == 0 {
+            anyhow::bail!("chunking.max_download_bytes must be > 0");
+        }
+        if self.chunking.max_download_bytes < self.chunking.chunk_size as u64 {
+            anyhow::bail!(
+                "chunking.max_download_bytes ({}) must be >= chunking.chunk_size ({}) — \
+                 otherwise no download can ever complete",
+                self.chunking.max_download_bytes,
+                self.chunking.chunk_size
+            );
         }
         Ok(())
     }

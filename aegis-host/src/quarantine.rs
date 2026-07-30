@@ -41,12 +41,7 @@ impl Quarantine {
                 })?;
         }
         #[cfg(windows)]
-        {
-            // VERIFY ON WINDOWS: apply restrictive ACL so only the Aegis
-            // service account can write. Requires `windows` crate with
-            // Win32_Security features. Phase 4 task.
-            tracing::warn!("[QUARANTINE] Windows ACL not yet applied to quarantine dir — Phase 4 task");
-        }
+        apply_windows_acl(&dir)?;
 
         tracing::info!("Quarantine directory ready: {}", dir.display());
         Ok(Self { dir })
@@ -112,29 +107,35 @@ impl Quarantine {
 /// - Limit length to 128 characters
 /// - Replace any remaining non-safe chars with `_`
 pub fn sanitize_filename(filename: &str) -> String {
-    // Strip path separators and null bytes
-    let stripped: String = filename
+    // Take the basename FIRST, while separators are still present — stripping
+    // them first (as this previously did) made the rsplit calls dead code.
+    let basename = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename);
+
+    // Now drop separators (none should remain) and null bytes.
+    let stripped: String = basename
         .chars()
         .filter(|&c| c != '/' && c != '\\' && c != '\0')
         .collect();
 
-    // Take only the basename (last component after any remaining separators)
-    let basename = stripped.rsplit('/').next().unwrap_or(&stripped);
-    let basename = basename.rsplit('\\').next().unwrap_or(basename);
-
-    // Check for `..`
-    let basename = if basename.contains("..") { "dotdot_stripped" } else { basename };
+    // Collapse `..` rather than discarding the whole name. Path traversal is
+    // already impossible here (the UUID prefix is the load-bearing component
+    // and this result is only ever a suffix), so there is no reason to throw
+    // away a legitimate name like `archive..v2.zip`.
+    let basename = stripped.replace("..", "_");
 
     // Check Windows reserved names (compare stem without extension, case-insensitive)
     let stem_upper = basename
         .split('.')
         .next()
-        .unwrap_or(basename)
+        .unwrap_or(&basename)
         .to_uppercase();
-    let basename = if WINDOWS_RESERVED.contains(&stem_upper.as_str()) {
+    let basename: &str = if WINDOWS_RESERVED.contains(&stem_upper.as_str()) {
         "_reserved_name_"
     } else {
-        basename
+        &basename
     };
 
     // Replace remaining chars that are not safe ASCII
@@ -160,6 +161,69 @@ pub fn sanitize_filename(filename: &str) -> String {
     }
 }
 
+/// Lock the quarantine directory down to the current user only.
+///
+/// Strips inherited ACEs and grants full control to exactly one principal. The
+/// directory holds live, unscanned, potentially malicious samples, so no other
+/// local account should be able to read or swap them mid-scan.
+///
+/// Uses `icacls` rather than raw `SetNamedSecurityInfo` FFI: it is a documented
+/// system tool, and building a DACL by hand is easy to get subtly and silently
+/// wrong. Arguments are passed as an argument array — never an interpolated
+/// shell string — per the secure-coding rules in the build spec §4.
+///
+/// FAIL CLOSED: an error here aborts host startup. If the directory that holds
+/// untrusted samples cannot be secured, running anyway would mean scanning
+/// files an attacker might be able to replace underneath us.
+#[cfg(windows)]
+fn apply_windows_acl(dir: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let username = std::env::var("USERNAME")
+        .context("USERNAME not set — cannot determine principal for quarantine ACL")?;
+    let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".to_string());
+    let principal = format!("{domain}\\{username}");
+
+    // 1. Remove all inherited ACEs so the parent temp dir's grants do not apply.
+    let out = Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:r")
+        .output()
+        .context("Failed to run icacls to strip inherited ACEs")?;
+    if !out.status.success() {
+        bail!(
+            "icacls /inheritance:r failed on {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // 2. Grant full control to the current user only.
+    //    (OI) object inherit, (CI) container inherit, F full control.
+    //    /grant:r replaces rather than adds to any existing grant.
+    let out = Command::new("icacls")
+        .arg(dir)
+        .arg("/grant:r")
+        .arg(format!("{principal}:(OI)(CI)F"))
+        .output()
+        .context("Failed to run icacls to grant quarantine access")?;
+    if !out.status.success() {
+        bail!(
+            "icacls /grant:r failed on {} for {}: {}",
+            dir.display(),
+            principal,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    tracing::info!(
+        dir = %dir.display(),
+        principal = %principal,
+        "Quarantine ACL applied — inheritance stripped, single-principal full control"
+    );
+    Ok(())
+}
+
 /// Query available disk space for the path's filesystem.
 fn available_space(path: &Path) -> Result<u64> {
     #[cfg(unix)]
@@ -174,14 +238,24 @@ fn available_space(path: &Path) -> Result<u64> {
             bail!("statvfs failed on {}: {}", path.display(), err);
         }
         let stat = unsafe { stat.assume_init() };
-        Ok(stat.f_bavail * stat.f_bsize)
+        // POSIX defines f_bavail in units of f_frsize, NOT f_bsize. Using
+        // f_bsize happens to work where the two are equal and silently
+        // misreports free space where they are not.
+        //
+        // checked_mul, not `*`: this feeds a fail-closed disk guard, and an
+        // overflow here would wrap to a small number and reject valid
+        // downloads, or (worse, on a different code path) wrap high.
+        let frsize = stat.f_frsize as u64;
+        let avail = stat.f_bavail as u64;
+        avail
+            .checked_mul(frsize)
+            .context("Free-space calculation overflowed (f_bavail * f_frsize)")
     }
 
     #[cfg(windows)]
     {
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        use windows::Win32::Foundation::ULARGE_INTEGER;
 
         let path_wide: Vec<u16> = path
             .to_string_lossy()
@@ -202,6 +276,71 @@ fn available_space(path: &Path) -> Result<u64> {
             .context("GetDiskFreeSpaceExW failed")?;
         }
         Ok(free_bytes_available)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Path traversal must never survive sanitization. The UUID prefix is the
+    /// load-bearing safety property, but the suffix must not be able to climb
+    /// out of the quarantine directory on its own either.
+    #[test]
+    fn sanitize_strips_traversal() {
+        for evil in [
+            "../../../../Windows/System32/evil.exe",
+            "..\\..\\Windows\\System32\\evil.exe",
+            "/etc/passwd",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+        ] {
+            let s = sanitize_filename(evil);
+            assert!(!s.contains('/'), "slash survived in {s:?} (from {evil:?})");
+            assert!(!s.contains('\\'), "backslash survived in {s:?} (from {evil:?})");
+            assert!(!s.contains(".."), "dotdot survived in {s:?} (from {evil:?})");
+        }
+    }
+
+    /// The basename must be taken BEFORE separators are filtered out.
+    /// Filtering first turns "a/b/evil.exe" into "abevil.exe" — it leaks the
+    /// directory components into the filename instead of discarding them.
+    #[test]
+    fn sanitize_takes_basename_not_concatenation() {
+        assert_eq!(sanitize_filename("dir/sub/report.pdf"), "report.pdf");
+        assert_eq!(sanitize_filename("dir\\sub\\report.pdf"), "report.pdf");
+    }
+
+    /// Legitimate names containing ".." should survive in recognisable form
+    /// rather than being replaced wholesale.
+    #[test]
+    fn sanitize_preserves_legitimate_names() {
+        assert_eq!(sanitize_filename("quarterly-report.pdf"), "quarterly-report.pdf");
+        assert_eq!(sanitize_filename("archive..v2.zip"), "archive_v2.zip");
+    }
+
+    /// Windows reserved device names must not be usable as a path component.
+    #[test]
+    fn sanitize_rejects_reserved_device_names() {
+        for reserved in ["CON", "con.txt", "NUL.dat", "COM1.bin", "lpt9.exe"] {
+            assert_eq!(
+                sanitize_filename(reserved),
+                "_reserved_name_",
+                "reserved device name {reserved:?} was not neutralised"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_null_bytes_and_never_returns_empty() {
+        assert!(!sanitize_filename("evil\0.exe").contains('\0'));
+        assert!(!sanitize_filename("").is_empty());
+        assert!(!sanitize_filename("///").is_empty());
+    }
+
+    #[test]
+    fn sanitize_bounds_length() {
+        let long = "a".repeat(5000);
+        assert!(sanitize_filename(&long).chars().count() <= 128);
     }
 }
 

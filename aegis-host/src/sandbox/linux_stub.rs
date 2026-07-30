@@ -14,6 +14,12 @@ use std::path::Path;
 #[derive(Debug, Default)]
 pub struct StubSandbox;
 
+impl StubSandbox {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait]
 impl Sandbox for StubSandbox {
     async fn detonate(&self, binary_path: &Path, timeout_secs: u64) -> Result<DetonationReport> {

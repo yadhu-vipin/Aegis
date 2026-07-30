@@ -135,6 +135,16 @@ async fn run() -> Result<()> {
     let quarantine = Quarantine::new(&cfg.quarantine.subdir)?;
     let sandbox = sandbox::platform_sandbox();
 
+    // Clear abandoned files from sessions that never reached a verdict.
+    // The threshold is twice the total transfer timeout, so a legitimate
+    // in-flight download in a concurrent session can never be swept.
+    if let Ok(downloads) = release::downloads_dir() {
+        release::sweep_stale(
+            &downloads.join(&cfg.quarantine.subdir),
+            cfg.chunking.total_transfer_timeout() * 2,
+        );
+    }
+
     // Main message loop — process one session per invocation (Chrome spawns
     // a new host process per port.connectNative() call).
     loop {

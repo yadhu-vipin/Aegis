@@ -111,6 +111,53 @@ pub fn discard(quarantined: &Path, reason: &str) {
     }
 }
 
+/// Delete quarantine files left behind by sessions that never reached a verdict.
+///
+/// A rejected or crashed session abandons its file: the host declined to take
+/// ownership, so nothing ever cleaned it up. Six of these accumulated during a
+/// single debugging session, each a full copy of the download. Left alone they
+/// grow without bound inside the user's Downloads folder.
+///
+/// Only files older than `max_age` are touched, so a transfer in flight for
+/// another session is never deleted out from under it. Errors are logged and
+/// ignored — sweeping is hygiene, and must never prevent the host from starting.
+pub fn sweep_stale(quarantine_dir: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(quarantine_dir) else {
+        return; // directory may not exist yet; nothing to sweep
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut swept = 0u32;
+    let mut bytes = 0u64;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+
+        if age > max_age {
+            let size = meta.len();
+            if std::fs::remove_file(&path).is_ok() {
+                swept += 1;
+                bytes += size;
+            }
+        }
+    }
+
+    if swept > 0 {
+        tracing::info!(
+            files = swept,
+            bytes,
+            dir = %quarantine_dir.display(),
+            "Swept abandoned quarantine files from sessions that never reached a verdict"
+        );
+    }
+}
+
 /// Pick a non-colliding path in `dir` for `name`.
 ///
 /// Mirrors browser behaviour: `report.pdf`, `report (1).pdf`, `report (2).pdf`.

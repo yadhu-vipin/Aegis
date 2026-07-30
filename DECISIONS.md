@@ -290,6 +290,42 @@ high-risk signatures from the intent table (nc reverse shell, `/etc/shadow`,
 
 ---
 
+## Target Browser Is Edge, Not Chrome (found in testing)
+
+**Finding:** Google Chrome is not installed on the development machine at all.
+The installed Chromium-family browsers are **Brave** and **Microsoft Edge**, and
+the extension is loaded in **Edge** (its ID appears in
+`%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Preferences`).
+
+The installer registered the native messaging host only under
+`HKCU:\Software\Google\Chrome\NativeMessagingHosts\` — a hive belonging to a
+browser that does not exist here. Each Chromium browser reads **only its own**
+hive, so `connectNative()` failed, no host process was ever spawned, and
+`aegis-host.log` was never created.
+
+The symptom was maximally misleading: the extension's fail-closed policy turned
+"host not found" into "Aegis couldn't finish scanning this file", so **every**
+download was cancelled, including obviously benign ones. Three genuine bugs were
+found and fixed while chasing this (quarantine subdir drift, the
+sharing-violation crash, MV3 session loss) — all real, none of them the cause.
+
+**What actually settled it:** the absence of `aegis-host.log`. A missing log
+distinguishes "the host ran and made a decision" from "the host was never
+launched", and no amount of reading the code could separate those two.
+
+**Decision:** the installer now enumerates Chrome, Chromium, Brave, Edge and
+Vivaldi, registers under every hive whose browser is present, verifies each
+write by reading it back, and reports which browsers were registered. It also
+searches all of their profiles when auto-detecting the extension ID.
+
+**Note for the spec:** `AEGIS_BUILD_SPEC.md` §8 lists cross-browser support as
+out of scope, "Chrome MV3 only". That remains true of the *extension* — but host
+registration must still target whatever browser is actually installed, or the
+project cannot be run at all on this machine. Registering broadly costs nothing;
+assuming Chrome cost several hours.
+
+---
+
 ## Native Host Registration (Phase 1)
 
 **Finding:** `install_native_host.ps1` registered

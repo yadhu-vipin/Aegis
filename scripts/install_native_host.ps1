@@ -38,11 +38,34 @@ function Test-ExtensionId([string]$id) {
     return $id -cmatch '^[a-p]{32}$'
 }
 
+# Chromium-family browsers. Each looks ONLY in its own registry path for
+# native messaging hosts, so registering under Google\Chrome alone silently
+# fails on every other browser: connectNative() reports "host not found", no
+# host process is ever spawned, and there is nothing in any log to explain it.
+$Browsers = @(
+    @{ Name = "Chrome";   Reg = "HKCU:\Software\Google\Chrome\NativeMessagingHosts";                UserData = "$env:LOCALAPPDATA\Google\Chrome\User Data";              Exe = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" }
+    @{ Name = "Chromium"; Reg = "HKCU:\Software\Chromium\NativeMessagingHosts";                     UserData = "$env:LOCALAPPDATA\Chromium\User Data";                   Exe = "$env:ProgramFiles\Chromium\Application\chrome.exe" }
+    @{ Name = "Brave";    Reg = "HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts";  UserData = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"; Exe = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe" }
+    @{ Name = "Edge";     Reg = "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts";               UserData = "$env:LOCALAPPDATA\Microsoft\Edge\User Data";             Exe = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" }
+    @{ Name = "Vivaldi";  Reg = "HKCU:\Software\Vivaldi\NativeMessagingHosts";                      UserData = "$env:LOCALAPPDATA\Vivaldi\User Data";                    Exe = "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe" }
+)
+
+function Get-InstalledBrowsers {
+    # Presence of the user-data directory is the reliable signal: it exists
+    # once the browser has been run, regardless of install location, and it is
+    # also where we look up the extension ID.
+    $Browsers | Where-Object { (Test-Path $_.UserData) -or (Test-Path $_.Exe) }
+}
+
 function Find-ExtensionIdFromChrome([string]$unpackedPath) {
-    $prefsCandidates = @(
-        "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Preferences",
-        "$env:LOCALAPPDATA\Google\Chrome\User Data\Profile 1\Preferences"
-    )
+    $prefsCandidates = @()
+    foreach ($b in Get-InstalledBrowsers) {
+        if (-not (Test-Path $b.UserData)) { continue }
+        Get-ChildItem $b.UserData -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq "Default" -or $_.Name -like "Profile *" } |
+            ForEach-Object { $prefsCandidates += (Join-Path $_.FullName "Preferences") }
+    }
+
     $target = (Resolve-Path $unpackedPath -ErrorAction SilentlyContinue).Path
     if (-not $target) { return $null }
 
@@ -157,29 +180,42 @@ if ($firstBytes.Count -ge 3 -and $firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq
 Write-Host "  Wrote manifest (UTF-8, no BOM)" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------------------
-# Register in the Windows registry
+# Register in the Windows registry — for EVERY installed Chromium browser
 # ---------------------------------------------------------------------------
-# Per Chrome's native messaging docs the key is either
-#   HKLM\SOFTWARE\Google\Chrome\NativeMessagingHosts\<name>   (all users)
-#   HKCU\Software\Google\Chrome\NativeMessagingHosts\<name>   (current user)
-# and its DEFAULT value is the full path to the manifest. HKCU needs no admin.
-$RegKey = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
-New-Item -Path $RegKey -Force | Out-Null
-Set-ItemProperty -Path $RegKey -Name "(default)" -Value $ManifestPath
-
-# Read it back rather than trusting the write.
-$readBack = (Get-ItemProperty -Path $RegKey)."(default)"
-if ($readBack -ne $ManifestPath) {
-    Write-Host "ERROR: registry verification failed." -ForegroundColor Red
-    Write-Host "  expected: $ManifestPath"
-    Write-Host "  got     : $readBack"
+# The key's DEFAULT value is the full path to the manifest. HKCU needs no admin.
+# Each browser reads only its own hive, so registering under Google\Chrome
+# alone leaves Brave/Edge/Vivaldi users with a connectNative() that fails and
+# no diagnostic anywhere.
+$installed = Get-InstalledBrowsers
+if (-not $installed) {
+    Write-Host "ERROR: no Chromium-family browser found." -ForegroundColor Red
+    Write-Host "  Looked for Chrome, Chromium, Brave, Edge and Vivaldi." -ForegroundColor Yellow
     exit 1
+}
+
+$registered = @()
+foreach ($b in $installed) {
+    $RegKey = "$($b.Reg)\$HostName"
+    New-Item -Path $RegKey -Force | Out-Null
+    Set-ItemProperty -Path $RegKey -Name "(default)" -Value $ManifestPath
+
+    # Read back rather than trusting the write.
+    $readBack = (Get-ItemProperty -Path $RegKey)."(default)"
+    if ($readBack -ne $ManifestPath) {
+        Write-Host "ERROR: registry verification failed for $($b.Name)." -ForegroundColor Red
+        Write-Host "  expected: $ManifestPath"
+        Write-Host "  got     : $readBack"
+        exit 1
+    }
+    $registered += $b.Name
+    Write-Host "  Registered for $($b.Name)" -ForegroundColor DarkGray
 }
 
 Write-Host ""
 Write-Host "Installation complete." -ForegroundColor Green
-Write-Host "  Registry : $RegKey" -ForegroundColor DarkGray
+Write-Host "  Browsers : $($registered -join ', ')" -ForegroundColor DarkGray
 Write-Host "  Manifest : $ManifestPath" -ForegroundColor DarkGray
 Write-Host "  Binary   : $HostBinary" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "Restart Chrome for the registration to take effect." -ForegroundColor Yellow
+Write-Host "Fully quit and reopen your browser for this to take effect." -ForegroundColor Yellow
+Write-Host "(Closing the window is not enough - the registry is read at startup.)" -ForegroundColor Yellow

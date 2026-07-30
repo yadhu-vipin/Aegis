@@ -15,8 +15,12 @@ import base64
 import sys
 import os
 
-# Path to the compiled binary
-BINARY = os.path.join(os.path.dirname(__file__), "..", "aegis-host", "target", "debug", "aegis-host")
+# Path to the compiled binary (.exe on Windows)
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+BINARY = os.path.join(
+    os.path.dirname(__file__), "..", "aegis-host", "target", "debug",
+    "aegis-host" + EXE_SUFFIX,
+)
 AEGIS_TOML = os.path.join(os.path.dirname(__file__), "..", "aegis.toml")
 
 

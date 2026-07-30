@@ -13,9 +13,11 @@
 mod config;
 mod ipc;
 mod quarantine;
+mod release;
 mod risk;
 mod sandbox;
 mod scanner;
+mod watcher;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -79,6 +81,9 @@ async fn run() -> Result<()> {
         };
 
         match msg_type.as_str() {
+            "WATCH_BEGIN" => {
+                handle_watch_session(&msg, &cfg, &sandbox).await?;
+            }
             "START_DOWNLOAD" => {
                 handle_download_session(&msg, &cfg, &quarantine, &sandbox).await?;
             }
@@ -96,6 +101,290 @@ async fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// Validate a path supplied by the extension before we touch it.
+///
+/// TRUST BOUNDARY. `quarantine_path` crosses from the browser extension into a
+/// process that will read the file, and on a clean verdict *move* it into the
+/// user's Downloads folder. An unvalidated path here would be an arbitrary file
+/// read and an arbitrary file move — a compromised or buggy extension could
+/// name `C:\Windows\System32\config\SAM` and have Aegis helpfully relocate it.
+///
+/// Both sides are canonicalized before comparison so `..`, symlinks, junctions,
+/// and 8.3 short names cannot be used to slip outside the quarantine root.
+fn validate_quarantine_path(
+    claimed: &str,
+    expected_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let claimed_path = std::path::Path::new(claimed);
+
+    let root = expected_root.canonicalize().with_context(|| {
+        format!(
+            "quarantine root {} does not exist or cannot be resolved",
+            expected_root.display()
+        )
+    })?;
+
+    // The download may not exist yet (Chrome creates `.crdownload` first), so
+    // canonicalize the PARENT, which must already exist, and re-attach the
+    // filename. Canonicalizing a missing path would just fail.
+    let parent = claimed_path
+        .parent()
+        .context("quarantine path has no parent directory")?
+        .canonicalize()
+        .with_context(|| {
+            format!("quarantine path parent {claimed:?} does not exist or cannot be resolved")
+        })?;
+
+    if !parent.starts_with(&root) {
+        anyhow::bail!(
+            "REJECTED: extension supplied a path outside the quarantine root. \
+             claimed={claimed:?} resolved_parent={} root={}",
+            parent.display(),
+            root.display()
+        );
+    }
+
+    let file_name = claimed_path
+        .file_name()
+        .context("quarantine path has no filename component")?;
+
+    // Reject anything that is not the extension we hand out — a further guard
+    // against being pointed at an unrelated pre-existing file in the directory.
+    let name_str = file_name.to_string_lossy();
+    if !name_str.ends_with(".aegispart") {
+        anyhow::bail!("REJECTED: quarantine filename {name_str:?} is not a .aegispart file");
+    }
+
+    Ok(parent.join(file_name))
+}
+
+/// Watch a download Chrome is writing into quarantine, scanning as it grows.
+///
+/// This is the Phase 2 path: Chrome performs the single fetch (so cookies,
+/// sessions, POST bodies and one-time tokens all work) into a directory Aegis
+/// owns, and we tail it. Nothing reaches the user's Downloads folder unless
+/// `release::release` puts it there.
+async fn handle_watch_session(
+    msg: &Value,
+    cfg: &config::Config,
+    sandbox: &PlatformSandbox,
+) -> Result<()> {
+    let session_id = match msg.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            native_messaging::send_verdict(
+                "REJECTED_MALFORMED",
+                "WATCH_BEGIN missing 'session_id'",
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+
+    let claimed_path = match msg.get("quarantine_path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            native_messaging::send_verdict(
+                "REJECTED_MALFORMED",
+                "WATCH_BEGIN missing 'quarantine_path'",
+                Some(&session_id),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let original_filename = msg
+        .get("original_filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("download.bin")
+        .to_string();
+
+    // The quarantine root is a subdirectory of the real Downloads folder,
+    // because Chrome's onDeterminingFilename only accepts paths relative to it.
+    let downloads = release::downloads_dir()?;
+    let quarantine_root = downloads.join(&cfg.quarantine.subdir);
+    std::fs::create_dir_all(&quarantine_root).with_context(|| {
+        format!("create download quarantine dir {}", quarantine_root.display())
+    })?;
+
+    let quarantine_path = match validate_quarantine_path(claimed_path, &quarantine_root) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(session = %session_id, error = %e, "quarantine path rejected");
+            native_messaging::send_verdict(
+                "REJECTED_MALFORMED",
+                &format!("{e:#}"),
+                Some(&session_id),
+            )?;
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        session = %session_id,
+        path = %quarantine_path.display(),
+        original = %original_filename,
+        "Watching download in quarantine"
+    );
+
+    let target = watcher::WatchTarget::new(&quarantine_path);
+    let mut w = watcher::DownloadWatcher::new(target, original_filename.clone());
+
+    let sid = session_id.clone();
+    let event = watcher::watch_download(&mut w, cfg, |bytes, score| {
+        // Progress is advisory; a failed send must not abort the scan.
+        let _ = native_messaging::send_progress(&sid, bytes, score);
+    })
+    .await?;
+
+    match event {
+        watcher::WatchEvent::EarlyBlock { risk_score, reason } => {
+            // Killed mid-flight. Tell the extension first so it cancels the
+            // download promptly, then clean up both possible on-disk names.
+            native_messaging::send_early_block(&session_id, risk_score, &reason)?;
+            release::discard(&quarantine_path, "early block");
+            let partial = format!("{}.crdownload", quarantine_path.display());
+            release::discard(std::path::Path::new(&partial), "early block (partial)");
+
+            native_messaging::send_final_verdict(
+                &session_id,
+                "BLOCKED",
+                &format!("Blocked during download. {reason}"),
+                None,
+            )?;
+        }
+
+        watcher::WatchEvent::Completed(outcome) => {
+            let aggregate = ForensicResult {
+                risk_score: outcome.risk_score,
+                ..Default::default()
+            };
+            let decision = risk::decide(&aggregate, &cfg.risk);
+
+            tracing::info!(
+                session = %session_id,
+                risk_score = outcome.risk_score,
+                decision = %decision,
+                bytes = outcome.bytes_scanned,
+                "Download scan complete"
+            );
+
+            let cleared = match decision {
+                Decision::Block => {
+                    release::discard(&quarantine_path, "static verdict: block");
+                    native_messaging::send_final_verdict(
+                        &session_id,
+                        "BLOCKED",
+                        &format!(
+                            "Blocked. Risk {:.2}. Signals: {}",
+                            outcome.risk_score,
+                            outcome.descriptions.join("; ")
+                        ),
+                        None,
+                    )?;
+                    false
+                }
+
+                Decision::Release => true,
+
+                Decision::Sandbox | Decision::TooLargeToSandbox => {
+                    if outcome.bytes_scanned > cfg.sandbox.max_detonation_size {
+                        // Too big to detonate. FAIL CLOSED: we have an
+                        // ambiguous file we cannot examine further.
+                        release::discard(&quarantine_path, "too large to sandbox");
+                        native_messaging::send_final_verdict(
+                            &session_id,
+                            "BLOCKED",
+                            &format!(
+                                "Not released: risk {:.2} needs sandbox analysis, but the file \
+                                 ({} bytes) exceeds max_detonation_size ({}). Signals: {}",
+                                outcome.risk_score,
+                                outcome.bytes_scanned,
+                                cfg.sandbox.max_detonation_size,
+                                outcome.descriptions.join("; ")
+                            ),
+                            None,
+                        )?;
+                        false
+                    } else {
+                        match sandbox
+                            .detonate(&quarantine_path, cfg.sandbox.detonation_timeout_secs)
+                            .await
+                        {
+                            Ok(report) => {
+                                let after = risk::decide_after_sandbox(&report.verdict);
+                                if after == Decision::Release {
+                                    true
+                                } else {
+                                    release::discard(&quarantine_path, "sandbox verdict");
+                                    native_messaging::send_final_verdict(
+                                        &session_id,
+                                        "BLOCKED",
+                                        &format!(
+                                            "Sandbox verdict: {}. Behaviors: {}",
+                                            report.verdict,
+                                            report.flagged_behaviors.join("; ")
+                                        ),
+                                        None,
+                                    )?;
+                                    false
+                                }
+                            }
+                            Err(e) => {
+                                // FAIL CLOSED: a sandbox that errored told us
+                                // nothing, which is not the same as "clean".
+                                tracing::error!(error = ?e, "detonation failed");
+                                release::discard(&quarantine_path, "detonation error");
+                                native_messaging::send_final_verdict(
+                                    &session_id,
+                                    "BLOCKED",
+                                    &format!("Not released: sandbox analysis failed ({e:#})"),
+                                    None,
+                                )?;
+                                false
+                            }
+                        }
+                    }
+                }
+            };
+
+            if cleared {
+                match release::release(&quarantine_path, &downloads, &original_filename) {
+                    Ok(released) => {
+                        native_messaging::send_final_verdict(
+                            &session_id,
+                            "COMPLETE",
+                            &format!(
+                                "Released to Downloads. Risk {:.2}{}",
+                                outcome.risk_score,
+                                if released.renamed {
+                                    " (renamed to avoid overwriting an existing file)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            Some(&released.final_path.to_string_lossy()),
+                        )?;
+                    }
+                    Err(e) => {
+                        // Could not deliver it. Leave it quarantined rather
+                        // than half-releasing, and say so.
+                        tracing::error!(error = ?e, "release failed");
+                        native_messaging::send_final_verdict(
+                            &session_id,
+                            "ERROR",
+                            &format!("File passed scanning but could not be released: {e:#}"),
+                            None,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle a full download session: read chunks → scan → decide → verdict.

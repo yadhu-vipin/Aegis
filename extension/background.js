@@ -1,56 +1,89 @@
 /**
  * Aegis Service Worker — background.js
  *
- * Responsibilities:
- * 1. Layer 1: Forward CHECK_URL hover messages to local ML service (http://127.0.0.1:8787/score)
- *    with a 500ms timeout. Fail open ("unscored") if unreachable.
- * 2. Layer 2: Intercept downloads via chrome.downloads, stream file in 256KB chunks
- *    to Rust Native Host (com.aegis.sandbox), await VERDICT, release or cancel download.
+ * Layer 2 (file triage), Phase 2 architecture.
+ *
+ * HOW INTERCEPTION WORKS, AND WHY IT CHANGED
+ * ------------------------------------------
+ * Chrome exposes no API for a download's byte stream. The previous design
+ * worked around that by pausing the download and calling fetch() on the same
+ * URL to get the bytes — which meant:
+ *
+ *   - the file was written to the user's real Downloads folder anyway
+ *   - the URL was fetched TWICE (double bandwidth), and the bytes scanned were
+ *     not the bytes delivered, so a server could serve benign content to the
+ *     scan and malicious content to the browser
+ *   - POST-initiated, one-time-token, blob:, and auth-gated downloads simply
+ *     could not be re-fetched
+ *   - three separate error paths called resume(), releasing files uninspected
+ *
+ * Instead we now use onDeterminingFilename to redirect the download into a
+ * quarantine subdirectory that Aegis owns, and let Chrome perform the single
+ * fetch it was always going to perform. Cookies, sessions, POST bodies and
+ * one-time tokens all keep working. The native host tails the file as Chrome
+ * writes it and can cancel the download mid-flight. Nothing reaches the real
+ * Downloads folder unless the host moves it there after a clean verdict.
+ *
+ * FAIL CLOSED: every error path cancels the download. A scanner that cannot
+ * scan must not wave the file through.
  */
 
 const NATIVE_HOST_NAME = "com.aegis.sandbox";
 const ML_SERVICE_URL = "http://127.0.0.1:8787/score";
-const CHUNK_SIZE = 262144; // 256 KB
 
-// Active download sessions tracking
+/** Must match `quarantine.subdir` in aegis.toml. */
+const QUARANTINE_SUBDIR = "aegis-quarantine";
+
+/** downloadId -> session state */
 const activeSessions = new Map();
 
-// Recent verdicts storage for popup
-async function saveVerdictToStorage(verdictData) {
+// ---------------------------------------------------------------------------
+// Verdict history (for the popup)
+// ---------------------------------------------------------------------------
+
+async function saveVerdict(entry) {
   try {
     const { recentVerdicts = [] } = await chrome.storage.local.get("recentVerdicts");
-    recentVerdicts.unshift({
-      ...verdictData,
-      timestamp: new Date().toISOString()
-    });
-    // Keep last 20
-    if (recentVerdicts.length > 20) recentVerdicts.length = 20;
+    recentVerdicts.unshift({ ...entry, timestamp: new Date().toISOString() });
+    if (recentVerdicts.length > 50) recentVerdicts.length = 50;
     await chrome.storage.local.set({ recentVerdicts });
   } catch (err) {
-    console.error("[Aegis] Failed to save verdict to storage:", err);
+    console.error("[Aegis] Failed to persist verdict:", err);
   }
 }
 
-// Listen for messages from content scripts or popup
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+async function setBadge(text, color) {
+  try {
+    await chrome.action.setBadgeText({ text });
+    if (color) await chrome.action.setBadgeBackgroundColor({ color });
+  } catch { /* action API unavailable in some contexts */ }
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — URL hover check (unchanged; out of scope for this phase)
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "CHECK_URL") {
-    handleCheckUrl(message.url)
-      .then(sendResponse)
-      .catch((err) => {
-        console.warn("[Aegis] URL check error:", err);
-        sendResponse({ score: 0.5, label: "unscored", reason: err.message });
-      });
-    return true; // Async response
+    handleCheckUrl(message.url).then(sendResponse).catch((err) => {
+      sendResponse({ score: 0.5, label: "unscored", reason: err.message });
+    });
+    return true;
+  }
+  if (message.type === "GET_ACTIVE_SESSIONS") {
+    sendResponse(Array.from(activeSessions.values()).map((s) => ({
+      filename: s.originalFilename,
+      state: s.state,
+      bytesScanned: s.bytesScanned || 0,
+      riskScore: s.riskScore || 0
+    })));
+    return false;
   }
 });
 
-/**
- * Layer 1: Check URL against local ML service.
- */
 async function handleCheckUrl(url) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 500);
-
   try {
     const response = await fetch(ML_SERVICE_URL, {
       method: "POST",
@@ -59,177 +92,197 @@ async function handleCheckUrl(url) {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      return { score: 0.5, label: "unscored", reason: `HTTP ${response.status}` };
-    }
-
+    if (!response.ok) return { score: 0.5, label: "unscored", reason: `HTTP ${response.status}` };
     const data = await response.json();
+    // Validate the local service's response rather than trusting it — a
+    // misconfigured or compromised local service is inside the threat model.
     return {
       score: typeof data.score === "number" ? Math.min(Math.max(data.score, 0), 1) : 0.5,
-      label: data.label || "unscored"
+      label: typeof data.label === "string" ? data.label : "unscored"
     };
-  } catch (err) {
+  } catch {
     clearTimeout(timeoutId);
+    // Layer 1 fails OPEN by design: never block browsing because a local
+    // scoring service is down. This is a badge, not a gate. Layer 2 (below)
+    // fails CLOSED, which is where the actual safety property lives.
     return { score: 0.5, label: "unscored", reason: "ML service unreachable" };
   }
 }
 
+// ---------------------------------------------------------------------------
+// Layer 2 — download interception
+// ---------------------------------------------------------------------------
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
 /**
- * Layer 2: Intercept browser downloads.
+ * Redirect every download into the Aegis quarantine subdirectory.
+ *
+ * Chrome requires the suggested name to be RELATIVE to the default Downloads
+ * directory — absolute paths and ".." are rejected outright — so quarantine is
+ * necessarily a subfolder of Downloads. The host moves cleared files up into
+ * Downloads proper and deletes the rest.
  */
-chrome.downloads.onCreated.addListener((downloadItem) => {
-  if (activeSessions.has(downloadItem.id)) return;
+chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
+  const id = uuid();
+  const quarantineRelative = `${QUARANTINE_SUBDIR}/${id}.aegispart`;
 
-  console.log(`[Aegis] Download intercepted: ID=${downloadItem.id}, file=${downloadItem.filename}, url=${downloadItem.url}`);
+  // Remember the name the user expects to see, before we rename it away.
+  const originalFilename =
+    (downloadItem.filename && downloadItem.filename.split(/[\\/]/).pop()) ||
+    "download.bin";
 
-  // Pause download in Chrome while Aegis scans
-  chrome.downloads.pause(downloadItem.id);
+  activeSessions.set(downloadItem.id, {
+    sessionId: `s-${downloadItem.id}-${Date.now()}`,
+    quarantineId: id,
+    originalFilename,
+    url: downloadItem.url,
+    state: "pending",
+    port: null,
+    bytesScanned: 0,
+    riskScore: 0
+  });
 
-  const sessionId = `session-${downloadItem.id}-${Date.now()}`;
-  activeSessions.set(downloadItem.id, { sessionId, state: "scanning" });
+  console.log(`[Aegis] Redirecting "${originalFilename}" -> ${quarantineRelative}`);
 
-  processDownloadTriage(downloadItem, sessionId);
+  // "uniquify" so two concurrent downloads can never collide on one UUID.
+  suggest({ filename: quarantineRelative, conflictAction: "uniquify" });
 });
 
 /**
- * Stream file bytes to Aegis Rust host and handle verdict.
+ * Once Chrome has resolved the absolute path, start the host watching it.
  */
-async function processDownloadTriage(downloadItem, sessionId) {
+chrome.downloads.onChanged.addListener((delta) => {
+  const session = activeSessions.get(delta.id);
+  if (!session) return;
+
+  // The absolute path becomes known shortly after onDeterminingFilename.
+  if (delta.filename && delta.filename.current && session.state === "pending") {
+    session.absolutePath = delta.filename.current;
+    session.state = "scanning";
+    beginWatch(delta.id, session);
+  }
+
+  if (delta.state && delta.state.current === "interrupted" && session.state === "scanning") {
+    // Chrome gave up (network error, or our own cancel). Tear the session down.
+    console.log(`[Aegis] Download ${delta.id} interrupted`);
+    finishSession(delta.id);
+  }
+});
+
+/**
+ * Open the native port and tell the host which file to watch.
+ *
+ * FAIL CLOSED: if the host cannot be reached, the download is cancelled. The
+ * old code called resume() here, which released files uninspected precisely
+ * when the scanner was unavailable.
+ */
+function beginWatch(downloadId, session) {
   let port;
   try {
     port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
   } catch (err) {
-    console.error("[Aegis] Native host connection failed:", err);
-    // Fail cautious / warn user, then resume download if host missing
-    chrome.downloads.resume(downloadItem.id);
-    saveVerdictToStorage({
-      filename: downloadItem.filename,
-      url: downloadItem.url,
-      status: "WARNING",
-      verdict: "Aegis native host unreachable. Download resumed uninspected."
-    });
-    activeSessions.delete(downloadItem.id);
-    return;
+    return failClosed(downloadId, session, `native host unreachable: ${err.message}`);
   }
-
-  let resolveAck = null;
-  let verdictReceived = null;
+  session.port = port;
 
   port.onMessage.addListener((msg) => {
-    console.log("[Aegis Host Msg]:", msg);
-    if (msg.type === "CHUNK_ACK") {
-      if (resolveAck) resolveAck();
-    } else if (msg.type === "VERDICT") {
-      verdictReceived = msg;
-      handleVerdict(downloadItem, msg);
-      port.disconnect();
+    switch (msg.type) {
+      case "SCAN_PROGRESS":
+        session.bytesScanned = msg.bytes_scanned;
+        session.riskScore = msg.risk_score;
+        break;
+
+      case "EARLY_BLOCK":
+        // The whole point of the design: kill it before it finishes arriving.
+        console.warn(`[Aegis] EARLY BLOCK (risk ${msg.risk_score}): ${msg.reason}`);
+        session.state = "blocked";
+        chrome.downloads.cancel(downloadId, () => void chrome.runtime.lastError);
+        setBadge("!", "#c0392b");
+        break;
+
+      case "VERDICT":
+        handleVerdict(downloadId, session, msg);
+        break;
+
+      default:
+        console.debug("[Aegis] unhandled host message:", msg);
     }
   });
 
   port.onDisconnect.addListener(() => {
-    if (chrome.runtime.lastError) {
-      console.warn("[Aegis Port Disconnect Error]:", chrome.runtime.lastError.message);
+    const err = chrome.runtime.lastError;
+    if (session.state === "scanning") {
+      // The host died mid-scan. We have no verdict, so we cannot release.
+      failClosed(
+        downloadId,
+        session,
+        `host disconnected mid-scan${err ? `: ${err.message}` : ""}`
+      );
     }
-    if (!verdictReceived) {
-      chrome.downloads.resume(downloadItem.id);
-    }
-    activeSessions.delete(downloadItem.id);
   });
 
-  // 1. Send START_DOWNLOAD
   port.postMessage({
-    type: "START_DOWNLOAD",
-    session_id: sessionId,
-    filename: downloadItem.filename || "download.bin",
-    content_length: downloadItem.fileSize > 0 ? downloadItem.fileSize : null
+    type: "WATCH_BEGIN",
+    session_id: session.sessionId,
+    download_id: downloadId,
+    quarantine_path: session.absolutePath,
+    original_filename: session.originalFilename,
+    url: session.url
+  });
+}
+
+function handleVerdict(downloadId, session, msg) {
+  const released = msg.status === "COMPLETE";
+  session.state = released ? "released" : "blocked";
+
+  if (!released) {
+    // Cancel is idempotent enough here; if the download already finished,
+    // the host has deleted the quarantined file, so nothing is delivered.
+    chrome.downloads.cancel(downloadId, () => void chrome.runtime.lastError);
+  }
+
+  console.log(`[Aegis] ${msg.status}: ${msg.verdict}`);
+
+  saveVerdict({
+    filename: session.originalFilename,
+    url: session.url,
+    status: msg.status,
+    verdict: msg.verdict,
+    releasedPath: msg.released_path || null
   });
 
-  // 2. Fetch download stream and forward in 256KB chunks
-  try {
-    const response = await fetch(downloadItem.url);
-    if (!response.body) throw new Error("No response body available");
-
-    const reader = response.body.getReader();
-    let seq = 0;
-    let buffer = new Uint8Array(0);
-
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (value) {
-        // Concatenate new bytes into buffer
-        const newBuf = new Uint8Array(buffer.length + value.length);
-        newBuf.set(buffer);
-        newBuf.set(value, buffer.length);
-        buffer = newBuf;
-      }
-
-      // Send 256KB chunks while buffer is large enough or stream is done
-      while (buffer.length >= CHUNK_SIZE || (done && buffer.length > 0)) {
-        const chunkLength = Math.min(buffer.length, CHUNK_SIZE);
-        const chunkData = buffer.slice(0, chunkLength);
-        buffer = buffer.slice(chunkLength);
-
-        const isLast = done && buffer.length === 0;
-
-        // Base64 encode chunk
-        const base64Data = bytesToBase64(chunkData);
-
-        // Send CHUNK message & await CHUNK_ACK backpressure
-        const ackPromise = new Promise((res) => { resolveAck = res; });
-        port.postMessage({
-          type: "CHUNK",
-          session_id: sessionId,
-          seq: seq++,
-          is_last: isLast,
-          data: base64Data
-        });
-
-        await ackPromise;
-
-        if (isLast) break;
-      }
-
-      if (done) break;
-    }
-  } catch (err) {
-    console.error("[Aegis Stream Error]:", err);
-    // If stream fetching fails, let Chrome finish normally or report error
-    chrome.downloads.resume(downloadItem.id);
-  }
+  setBadge(released ? "" : "!", released ? undefined : "#c0392b");
+  finishSession(downloadId);
 }
 
 /**
- * Handle verdict response from Rust host.
+ * Cancel the download and record why. Used for every failure mode.
  */
-function handleVerdict(downloadItem, msg) {
-  const status = msg.status;
-  const verdictMsg = msg.verdict;
+function failClosed(downloadId, session, reason) {
+  console.error(`[Aegis] FAIL CLOSED — cancelling download: ${reason}`);
+  session.state = "blocked";
+  chrome.downloads.cancel(downloadId, () => void chrome.runtime.lastError);
 
-  console.log(`[Aegis Verdict] Download ID=${downloadItem.id}: status=${status}, verdict=${verdictMsg}`);
-
-  if (status === "BLOCKED" || status === "REJECTED_MALFORMED") {
-    // Cancel download
-    chrome.downloads.cancel(downloadItem.id);
-  } else {
-    // Release / Resume clean download
-    chrome.downloads.resume(downloadItem.id);
-  }
-
-  saveVerdictToStorage({
-    filename: downloadItem.filename,
-    url: downloadItem.url,
-    status: status,
-    verdict: verdictMsg
+  saveVerdict({
+    filename: session.originalFilename,
+    url: session.url,
+    status: "BLOCKED",
+    verdict:
+      `Download cancelled because Aegis could not verify it (${reason}). ` +
+      `The file was not saved.`
   });
+
+  setBadge("!", "#c0392b");
+  finishSession(downloadId);
 }
 
-function bytesToBase64(bytes) {
-  let binary = "";
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+function finishSession(downloadId) {
+  const session = activeSessions.get(downloadId);
+  if (session?.port) {
+    try { session.port.disconnect(); } catch { /* already gone */ }
   }
-  return btoa(binary);
+  activeSessions.delete(downloadId);
 }

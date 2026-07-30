@@ -211,6 +211,85 @@ analysis plus the quarantine broker, not the detonation stage.
 
 ---
 
+## Phase 2 — Interception Re-Architecture
+
+**Problem:** Chrome exposes no API for a download's byte stream. The old design
+worked around that by pausing the download and calling `fetch()` on the same URL
+to obtain the bytes. Consequences, all real:
+
+- the file was written to the user's actual Downloads folder regardless —
+  `pause()` does not prevent that, and `resume()` completes it in place
+- the URL was fetched **twice**, so the bytes scanned were not the bytes
+  delivered. A server can serve benign content to the scanner and malicious
+  content to the browser (TOCTOU). Bandwidth also doubled.
+- POST-initiated, one-time-token, `blob:`, and auth-gated downloads cannot be
+  re-fetched at all, so they were simply broken
+- three separate error paths called `resume()`, releasing files **uninspected**
+  exactly when the scanner was unavailable
+
+**Decision:** `downloads.onDeterminingFilename` redirects every download into
+`<Downloads>/aegis-quarantine/{uuid}.aegispart`. Chrome performs the single
+fetch it was always going to perform — cookies, sessions, POST bodies and
+one-time tokens keep working — and the host *tails the file as Chrome writes
+it*. Nothing reaches the real Downloads folder unless `release::release()` puts
+it there after a clean verdict.
+
+Quarantine must live under Downloads because Chrome requires suggested
+filenames to be **relative to the default download directory**; absolute paths
+and `..` are rejected (verified against Chrome's documentation). This is a
+constraint, not a preference.
+
+**Every extension failure path now cancels**, never resumes: host unreachable,
+port disconnected mid-scan, and any unexpected error all call
+`chrome.downloads.cancel()`.
+
+**Deliberate asymmetry:** Layer 1 (URL hover badge) fails **open** — never block
+browsing because a local scoring service is down; it is an advisory badge, not a
+gate. Layer 2 (file triage) fails **closed**. The safety property lives in
+Layer 2 and it should not be weakened to match Layer 1's convenience.
+
+### Trust boundary: `quarantine_path`
+
+`WATCH_BEGIN` carries a path chosen by the extension. That crosses from the
+browser into a process which will read the file and, on a clean verdict, **move
+it into the user's Downloads folder**. Unvalidated, that is an arbitrary file
+read and an arbitrary file move — a compromised extension could name
+`C:\Windows\System32\config\SAM` and have Aegis relocate it.
+
+`validate_quarantine_path()` canonicalizes both the claimed parent and the
+quarantine root before comparing, so `..`, symlinks, junctions and 8.3 short
+names cannot escape, and additionally requires the `.aegispart` suffix so the
+host cannot be pointed at an unrelated pre-existing file in the directory.
+
+### Interaction with Windows Defender (found by a failing test)
+
+Writing EICAR to the quarantine directory caused `os error 225`
+(`ERROR_VIRUS_INFECTED`) when the watcher tried to open it: **Defender's
+real-time protection quarantined the file first.**
+
+This is correct behaviour by Defender and the user is protected, but Aegis must
+not treat it as a crash. `ScanStep::ExternallyQuarantined` maps it to a normal
+BLOCK verdict naming the other product.
+
+**Explicitly rejected:** adding a Defender exclusion for the quarantine
+directory. That would disable real-time protection on the one folder guaranteed
+to contain live malware, trading a genuine layer of defence for cosmetic
+attribution of the block. Losing the race to Defender on signature-known malware
+is the correct outcome.
+
+This also sharpens the honest answer to "how is this different from Defender":
+for known signatures Defender wins, and should. Aegis's contribution is the
+**unknown sample** and the **pre-completion kill** — scanning as bytes arrive
+and cancelling mid-transfer, which an on-write scanner by definition cannot do
+because it acts once bytes are already on disk.
+
+**Testing note:** on-disk tests must not use EICAR on a machine with Defender
+active, or they measure Defender rather than Aegis. `watcher.rs` tests use real
+high-risk signatures from the intent table (nc reverse shell, `/etc/shadow`,
+`/dev/tcp`) instead.
+
+---
+
 ## Native Host Registration (Phase 1)
 
 **Finding:** `install_native_host.ps1` registered

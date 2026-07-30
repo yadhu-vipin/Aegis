@@ -108,3 +108,50 @@ pub fn send_chunk_ack(session_id: &str, seq: u64) -> Result<()> {
         "seq": seq,
     }))
 }
+
+/// Tell the extension to cancel this download RIGHT NOW.
+///
+/// Sent mid-transfer when the running risk score crosses the block threshold.
+/// This is the "catch it before it finishes downloading" path — the extension
+/// responds with `chrome.downloads.cancel()`, so the remaining bytes are never
+/// even fetched.
+pub fn send_early_block(session_id: &str, risk_score: f32, reason: &str) -> Result<()> {
+    write_message(&serde_json::json!({
+        "type": "EARLY_BLOCK",
+        "session_id": session_id,
+        "risk_score": risk_score,
+        "reason": reason,
+    }))
+}
+
+/// Progress ping so the popup can show a live scanning state.
+pub fn send_progress(session_id: &str, bytes_scanned: u64, risk_score: f32) -> Result<()> {
+    write_message(&serde_json::json!({
+        "type": "SCAN_PROGRESS",
+        "session_id": session_id,
+        "bytes_scanned": bytes_scanned,
+        "risk_score": risk_score,
+    }))
+}
+
+/// Terminal verdict for a watched download.
+///
+/// `released_path` is populated only when the file actually reached the user's
+/// Downloads folder, so the extension never claims a release that did not occur.
+pub fn send_final_verdict(
+    session_id: &str,
+    status: &str,
+    verdict: &str,
+    released_path: Option<&str>,
+) -> Result<()> {
+    let mut obj = serde_json::json!({
+        "type": "VERDICT",
+        "status": status,
+        "verdict": verdict,
+        "session_id": session_id,
+    });
+    if let Some(p) = released_path {
+        obj["released_path"] = Value::String(p.to_string());
+    }
+    write_message(&obj)
+}

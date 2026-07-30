@@ -14,6 +14,14 @@
     <div class="status-badge" id="protection-status">Active</div>
   </div>
 
+  <!-- Surfaces a broken host installation directly, instead of letting it
+       masquerade as "Aegis thinks all your files are malware". -->
+  <div class="health-banner" id="health-banner" hidden>
+    <div class="health-title" id="health-title"></div>
+    <div class="health-detail" id="health-detail"></div>
+    <button class="health-retry" id="health-retry" type="button">Re-check</button>
+  </div>
+
   <div class="section">
     <div class="section-title">Protection Controls</div>
     <div class="toggle-row">

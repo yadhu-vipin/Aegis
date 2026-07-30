@@ -132,6 +132,21 @@ async fn run() -> Result<()> {
         };
 
         match msg_type.as_str() {
+            // Liveness probe. The extension sends this on start-up so a broken
+            // installation is visible in the popup as "Aegis cannot reach its
+            // scanner" rather than silently turning into "every download is
+            // blocked" the next time the user downloads something.
+            "PING" => {
+                tracing::info!("PING received — host is reachable");
+                native_messaging::write_message(&serde_json::json!({
+                    "type": "PONG",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "exe": std::env::current_exe()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    "quarantine_subdir": cfg.quarantine.subdir,
+                }))?;
+            }
             "WATCH_BEGIN" => {
                 // Contain failures to this one download. Propagating here would
                 // end run(), exit the process, and drop the native port — which

@@ -130,6 +130,93 @@ chrome.runtime.onStartup.addListener(restoreSessions);
 chrome.runtime.onInstalled.addListener(restoreSessions);
 
 // ---------------------------------------------------------------------------
+// Native host health check
+// ---------------------------------------------------------------------------
+//
+// Without this, a broken host installation is invisible until the user
+// downloads something — and then the fail-closed policy turns "host not found"
+// into "every download is blocked", which looks like Aegis deciding your files
+// are malware rather than Aegis being unable to run at all. Those need to be
+// distinguishable, and the distinction belongs in the UI, not in devtools.
+
+const HEALTH_KEY = "hostHealth";
+
+async function setHealth(h) {
+  try {
+    await chrome.storage.session.set({ [HEALTH_KEY]: { ...h, checkedAt: Date.now() } });
+  } catch { /* session storage unavailable */ }
+}
+
+/**
+ * Connect to the native host and ask it to identify itself.
+ *
+ * Resolves with the exact browser-side error string on failure — that string
+ * ("Specified native messaging host not found", "Access to the specified
+ * native messaging host is forbidden", "Failed to start native messaging
+ * host") distinguishes a missing registry key from a rejected extension origin
+ * from a binary that will not launch. They have completely different fixes.
+ */
+function probeNativeHost() {
+  return new Promise((resolve) => {
+    let port;
+    let settled = false;
+
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try { port?.disconnect(); } catch { /* already gone */ }
+      setHealth(result);
+      resolve(result);
+    };
+
+    try {
+      port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    } catch (err) {
+      return done({ ok: false, error: err.message, stage: "connectNative threw" });
+    }
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === "PONG") {
+        console.log(`[Aegis] host reachable — v${msg.version} at ${msg.exe}`);
+        done({
+          ok: true,
+          version: msg.version,
+          exe: msg.exe,
+          quarantineSubdir: msg.quarantine_subdir
+        });
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      done({
+        ok: false,
+        error: err ? err.message : "host disconnected without replying",
+        stage: "port disconnected"
+      });
+    });
+
+    port.postMessage({ type: "PING" });
+
+    // The host answers immediately or not at all.
+    setTimeout(() => done({ ok: false, error: "host did not reply within 5s", stage: "timeout" }), 5000);
+  });
+}
+
+// Probe on every worker start so the popup always reflects current reality.
+probeNativeHost().then((h) => {
+  if (!h.ok) {
+    console.error(
+      `[Aegis] NATIVE HOST UNREACHABLE (${h.stage}): ${h.error}\n` +
+      `  Downloads will be BLOCKED while this is true, because Aegis cannot ` +
+      `verify them.\n  Run scripts\\verify_native_host.ps1 to diagnose, or turn ` +
+      `off Layer 2 in the popup to browse normally.`
+    );
+    setBadge("?", "#f59e0b");
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Verdict history (for the popup)
 // ---------------------------------------------------------------------------
 
@@ -249,6 +336,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     handleCheckUrl(message.url).then(sendResponse).catch((err) => {
       sendResponse({ score: 0.5, label: "unscored", reason: err.message });
     });
+    return true;
+  }
+  if (message.type === "GET_HEALTH") {
+    chrome.storage.session.get(HEALTH_KEY)
+      .then(({ [HEALTH_KEY]: h }) => sendResponse(h || null))
+      .catch(() => sendResponse(null));
+    return true;
+  }
+  if (message.type === "RECHECK_HEALTH") {
+    probeNativeHost().then(sendResponse);
     return true;
   }
   if (message.type === "GET_ACTIVE_SESSIONS") {

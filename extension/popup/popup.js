@@ -119,7 +119,63 @@ function renderActiveScan(scan) {
   return row;
 }
 
+/**
+ * Translate the browser's native-messaging error into something actionable.
+ *
+ * These strings have completely different fixes, and "it doesn't work" hides
+ * which one you're looking at.
+ */
+function healthAdvice(error = "") {
+  const e = error.toLowerCase();
+  if (e.includes("not found")) {
+    return "The scanner isn't registered with this browser. Run scripts\\install_native_host.ps1, then fully restart the browser via edge://restart.";
+  }
+  if (e.includes("forbidden")) {
+    return "This extension's ID isn't in the scanner's allowed list. Re-run install_native_host.ps1 with the ID shown on this extension's card.";
+  }
+  if (e.includes("failed to start")) {
+    return "The scanner is registered but won't launch. Check that aegis-host.exe exists and isn't blocked by antivirus or an app-control policy.";
+  }
+  if (e.includes("exited") || e.includes("without replying")) {
+    return "The scanner started but quit immediately. Check aegis-host.log next to the binary.";
+  }
+  return "Run scripts\\verify_native_host.ps1 to diagnose.";
+}
+
+async function refreshHealth() {
+  const banner = document.getElementById("health-banner");
+  const title = document.getElementById("health-title");
+  const detail = document.getElementById("health-detail");
+  if (!banner) return;
+
+  let h = null;
+  try {
+    h = await chrome.runtime.sendMessage({ type: "GET_HEALTH" });
+  } catch { /* worker asleep */ }
+
+  if (!h) {
+    banner.hidden = true;
+    return;
+  }
+
+  if (h.ok) {
+    banner.hidden = false;
+    banner.className = "health-banner ok";
+    title.textContent = "Scanner connected";
+    detail.textContent = `aegis-host v${h.version}`;
+  } else {
+    banner.hidden = false;
+    banner.className = "health-banner bad";
+    title.textContent = "Scanner unreachable — downloads will be blocked";
+    // Both the raw error and what to do about it: the raw string is what you
+    // search for, the advice is what you act on.
+    detail.textContent = `${h.error}\n\n${healthAdvice(h.error)}`;
+  }
+}
+
 async function refresh() {
+  await refreshHealth();
+
   const listEl = document.getElementById("verdict-list");
   listEl.textContent = "";
 
@@ -166,6 +222,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   toggleL2.addEventListener("change", () =>
     chrome.storage.local.set({ layer2Enabled: toggleL2.checked })
   );
+
+  const retryBtn = document.getElementById("health-retry");
+  if (retryBtn) {
+    retryBtn.addEventListener("click", async () => {
+      retryBtn.disabled = true;
+      retryBtn.textContent = "Checking…";
+      try {
+        await chrome.runtime.sendMessage({ type: "RECHECK_HEALTH" });
+      } catch { /* worker restarting */ }
+      await refreshHealth();
+      retryBtn.disabled = false;
+      retryBtn.textContent = "Re-check";
+    });
+  }
 
   const clearBtn = document.getElementById("clear-history");
   if (clearBtn) {

@@ -139,6 +139,49 @@ input:checked + .slider:before {
   margin-top: 2px;
 }
 
+/* --- health banner --------------------------------------------------- */
+
+.health-banner {
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  border-left: 4px solid #64748b;
+  background-color: #1e293b;
+}
+
+.health-banner.ok  { border-left-color: #10b981; }
+.health-banner.bad { border-left-color: #ef4444; background-color: #2a1520; }
+
+.health-title {
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+.health-banner.ok  .health-title { color: #10b981; }
+.health-banner.bad .health-title { color: #fca5a5; }
+
+/* pre-wrap so the raw error and the advice stay on separate lines */
+.health-detail {
+  font-size: 11px;
+  color: #cbd5e1;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.health-retry {
+  margin-top: 8px;
+  background-color: #334155;
+  color: #f8fafc;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.health-retry:hover:not(:disabled) { background-color: #475569; }
+.health-retry:disabled { opacity: 0.6; cursor: default; }
+
 /* --- verdict rows --------------------------------------------------- */
 
 .section-header {

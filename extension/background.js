@@ -257,6 +257,21 @@ async function setBadge(text, color) {
 function humanReason(verdictText = "") {
   const t = verdictText.toLowerCase();
 
+  // --- Aegis's OWN failures come first --------------------------------
+  // These are NOT judgements about the file. Reporting a misconfigured
+  // scanner as "this file is suspicious" tells the user their legitimate
+  // download is dangerous, which is both false and corrosive to trust —
+  // they stop believing the warnings that matter.
+  if (t.includes("aegis.toml") || t.includes("config")) {
+    return "Aegis isn't set up correctly (its configuration file is missing), so it couldn't check this file. This is not a problem with the file itself.";
+  }
+  if (t.includes("scanning failed") || t.includes("internal decision error")) {
+    return "Aegis hit an internal error while checking this file. This is not a judgement about the file itself.";
+  }
+  if (t.includes("could not be released")) {
+    return "The file passed all checks, but Aegis couldn't move it into your Downloads folder.";
+  }
+
   if (t.includes("another security product") || t.includes("windows defender")) {
     return "Windows Defender identified this file as malware and removed it.";
   }
@@ -293,7 +308,32 @@ function humanReason(verdictText = "") {
   if (t.includes("stalled")) {
     return "The download stalled and was abandoned.";
   }
-  return "Aegis found something suspicious in this file.";
+  // Deliberately NOT "Aegis found something suspicious". This branch is
+  // reached when we do not recognise the verdict, and guessing "malicious"
+  // for an unrecognised string is how an Aegis malfunction ends up being
+  // reported to the user as a dangerous file.
+  return "Aegis blocked this download but couldn't summarise why — see the technical detail below.";
+}
+
+/**
+ * Does this verdict describe the FILE, or describe Aegis failing?
+ *
+ * The two need different wording, different notification titles and different
+ * colours. "Your file is malware" and "the scanner is broken" are not the same
+ * message and must never look the same.
+ */
+function isInfrastructureFailure(status, verdictText = "") {
+  if (status === "ERROR") return true;
+  const t = verdictText.toLowerCase();
+  return (
+    t.includes("aegis.toml") ||
+    t.includes("scanning failed") ||
+    t.includes("internal decision error") ||
+    t.includes("could not verify") ||
+    t.includes("unreachable") ||
+    t.includes("disconnected") ||
+    t.includes("could not be released")
+  );
 }
 
 let notificationSeq = 0;
@@ -302,16 +342,31 @@ let notificationSeq = 0;
  * Raise a desktop notification. Blocks are loud; releases stay quiet so we
  * don't train the user to dismiss Aegis notifications on reflex.
  */
-function notify({ blocked, filename, verdictText, earlyKill }) {
+function notify({ blocked, filename, verdictText, earlyKill, infrastructure }) {
   const id = `aegis-${Date.now()}-${notificationSeq++}`;
 
-  const title = blocked
-    ? (earlyKill ? "Aegis stopped a download mid-transfer" : "Aegis blocked a download")
-    : "Aegis cleared a download";
+  let title;
+  if (!blocked) {
+    title = "Aegis cleared a download";
+  } else if (infrastructure) {
+    // Say plainly that this is Aegis's fault, not the file's.
+    title = "Aegis couldn't check this download";
+  } else if (earlyKill) {
+    title = "Aegis stopped a download mid-transfer";
+  } else {
+    title = "Aegis blocked a download";
+  }
 
-  const message = blocked
-    ? `${filename}\n\n${humanReason(verdictText)}\n\nThe file was not saved to your computer.`
-    : `${filename} was scanned and saved.`;
+  let message;
+  if (!blocked) {
+    message = `${filename} was scanned and saved.`;
+  } else if (infrastructure) {
+    message =
+      `${filename}\n\n${humanReason(verdictText)}\n\n` +
+      `The file was not saved. Nothing is wrong with the file — Aegis could not run.`;
+  } else {
+    message = `${filename}\n\n${humanReason(verdictText)}\n\nThe file was not saved to your computer.`;
+  }
 
   try {
     chrome.notifications.create(id, {
@@ -558,7 +613,16 @@ function beginWatch(downloadId, session) {
 
 function handleVerdict(downloadId, session, msg) {
   const released = msg.status === "COMPLETE";
+  const infrastructure = isInfrastructureFailure(msg.status, msg.verdict);
   session.state = released ? "released" : "blocked";
+
+  if (infrastructure) {
+    // Aegis broke. The download is still (correctly) not released — we cannot
+    // vouch for a file we never scanned — but the UI must not claim the file
+    // was judged dangerous, and the badge should read "misconfigured" rather
+    // than "threat".
+    console.error(`[Aegis] INFRASTRUCTURE FAILURE, not a file verdict: ${msg.verdict}`);
+  }
 
   if (!released) {
     // Cancel is idempotent enough here; if the download already finished,
@@ -571,9 +635,10 @@ function handleVerdict(downloadId, session, msg) {
   saveVerdict({
     filename: session.originalFilename,
     url: session.url,
-    status: msg.status,
+    status: infrastructure ? "AEGIS_ERROR" : msg.status,
     verdict: msg.verdict,
     reason: humanReason(msg.verdict),
+    infrastructure,
     releasedPath: msg.released_path || null
   });
 
@@ -581,12 +646,16 @@ function handleVerdict(downloadId, session, msg) {
   if (!session.earlyKill) {
     notify({
       blocked: !released,
+      infrastructure,
       filename: session.originalFilename,
       verdictText: msg.verdict
     });
   }
 
-  setBadge(released ? "" : "!", released ? undefined : "#c0392b");
+  // Amber "?" for "Aegis is broken", red "!" for "this file is dangerous".
+  if (released) setBadge("", undefined);
+  else if (infrastructure) setBadge("?", "#f59e0b");
+  else setBadge("!", "#c0392b");
   finishSession(downloadId);
 }
 
@@ -602,16 +671,25 @@ function failClosed(downloadId, session, reason) {
     `Download cancelled because Aegis could not verify it (${reason}). ` +
     `The file was not saved.`;
 
+  // failClosed only ever fires because Aegis could not run — the host was
+  // unreachable, or the port dropped mid-scan. It is never a judgement about
+  // the file, so it must not be presented as one.
   saveVerdict({
     filename: session.originalFilename,
     url: session.url,
-    status: "BLOCKED",
+    status: "AEGIS_ERROR",
     verdict,
-    reason: humanReason(verdict)
+    reason: humanReason(verdict),
+    infrastructure: true
   });
 
-  notify({ blocked: true, filename: session.originalFilename, verdictText: verdict });
-  setBadge("!", "#c0392b");
+  notify({
+    blocked: true,
+    infrastructure: true,
+    filename: session.originalFilename,
+    verdictText: verdict
+  });
+  setBadge("?", "#f59e0b");
   finishSession(downloadId, session);
 }
 

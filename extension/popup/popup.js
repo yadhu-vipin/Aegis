@@ -13,7 +13,10 @@ const STATUS_STYLE = {
   REJECTED_MALFORMED: { cls: "blocked", icon: "⛔", label: "Rejected" },
   REJECTED_TOO_LARGE: { cls: "blocked", icon: "⛔", label: "Too large" },
   REJECTED_INSUFFICIENT_SPACE: { cls: "warn", icon: "⚠", label: "No disk space" },
-  ERROR: { cls: "warn", icon: "⚠", label: "Error" }
+  // Aegis failed — NOT a judgement about the file. Amber, never red, and
+  // never worded as though the download was found to be dangerous.
+  AEGIS_ERROR: { cls: "warn", icon: "⚙", label: "Aegis error" },
+  ERROR: { cls: "warn", icon: "⚙", label: "Aegis error" }
 };
 
 function styleFor(status) {
@@ -65,6 +68,14 @@ function renderVerdict(item) {
   reason.textContent = item.reason || item.verdict || style.label;
 
   row.append(head, reason);
+
+  // Make it unmistakable that Aegis broke rather than the file being bad.
+  if (item.infrastructure) {
+    const note = document.createElement("div");
+    note.className = "verdict-infra-note";
+    note.textContent = "Not a verdict about this file — Aegis itself failed to run.";
+    row.appendChild(note);
+  }
 
   // Full technical detail, collapsed. Useful when explaining a decision;
   // noise the rest of the time.

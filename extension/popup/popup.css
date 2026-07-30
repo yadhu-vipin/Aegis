@@ -232,6 +232,14 @@ input:checked + .slider:before {
   line-height: 1.4;
 }
 
+/* Aegis-broke marker — deliberately distinct from a threat verdict. */
+.verdict-infra-note {
+  font-size: 10px;
+  color: #fbbf24;
+  margin-top: 4px;
+  font-style: italic;
+}
+
 .verdict-details { margin-top: 6px; }
 
 .verdict-details summary {

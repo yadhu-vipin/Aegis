@@ -1,9 +1,9 @@
 {
   "name": "com.aegis.sandbox",
   "description": "Aegis Host Sandbox Native Messaging Host",
-  "path": "aegis-host.exe",
+  "path": "C:\\Users\\yadhu\\OneDrive\\Documents\\Projects\\Aegis\\aegis-host\\target\\debug\\aegis-host.exe",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://aegisdownloadguardextensionid/"
+    "chrome-extension://ialjcnkkdflhhipkgkmajdnlibejgmff/"
   ]
 }

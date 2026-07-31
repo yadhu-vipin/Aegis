@@ -481,7 +481,6 @@ mod tests {
         use crate::config::*;
         Config {
             host: HostConfig { log_level: "debug".into() },
-            ml: MlConfig { service_url: "http://127.0.0.1:8787/score".into(), timeout_ms: 500 },
             risk: RiskConfig { sandbox_threshold: 0.4, block_threshold: 0.85 },
             chunking: ChunkingConfig {
                 chunk_size: 4096,

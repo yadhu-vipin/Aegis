@@ -5,11 +5,14 @@
 # Log level: error | warn | info | debug | trace
 log_level = "info"
 
-[ml]
-# URL of the local ML inference service
-service_url = "http://127.0.0.1:8787/score"
-# Timeout in milliseconds for ML service calls
-timeout_ms = 500
+# There is no [ml] section. Aegis makes no network requests of any kind.
+#
+# URL/phishing scoring (Layer 1) is a separate project and out of scope here.
+# The HTTP client that called it was removed along with the setting: it was
+# more than half the dependency tree, brought a TLS stack this program has no
+# use for, and was the host's only outbound network capability. CHECK_URL still
+# answers, with "unscored" - which is exactly what it answered before, since no
+# scoring service has ever run on this machine.
 
 [risk]
 # Score >= sandbox_threshold -> send to HCS detonation

@@ -15,7 +15,6 @@ use std::time::Duration;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub host: HostConfig,
-    pub ml: MlConfig,
     pub risk: RiskConfig,
     pub chunking: ChunkingConfig,
     pub quarantine: QuarantineConfig,
@@ -24,18 +23,6 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct HostConfig {
     pub log_level: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct MlConfig {
-    pub service_url: String,
-    pub timeout_ms: u64,
-}
-
-impl MlConfig {
-    pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms)
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

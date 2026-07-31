@@ -237,7 +237,7 @@ async fn run() -> Result<()> {
             }
             "CHECK_URL" => {
                 // Layer 1 — URL check forwarded to ML service
-                handle_url_check(&msg, &cfg).await?;
+                handle_url_check(&msg).await?;
             }
             _ => {
                 tracing::warn!("Unknown message type: {}", msg_type);
@@ -624,72 +624,41 @@ async fn handle_watch_session(msg: &Value, cfg: &config::Config) -> Result<()> {
 }
 
 
-/// Handle a CHECK_URL message — forward to ML inference service.
-async fn handle_url_check(msg: &Value, cfg: &config::Config) -> Result<()> {
-    let url = match msg.get("url").and_then(|v| v.as_str()) {
-        Some(u) => u.to_string(),
-        None => {
-            native_messaging::send_verdict("REJECTED_MALFORMED", "CHECK_URL missing 'url'", None)?;
-            return Ok(());
-        }
-    };
-
-    // Validate URL length — cap before sending to ML service
-    if url.len() > 2048 {
-        native_messaging::write_message(&serde_json::json!({
-            "type": "URL_SCORE",
-            "score": 0.5,
-            "label": "unscored",
-            "reason": "URL too long to score"
-        }))?;
+/// Handle a CHECK_URL message.
+///
+/// Answers `unscored` and makes no network request. The protocol contract is
+/// unchanged — the extension already treats `unscored` as "no opinion" and
+/// shows a neutral badge — so this is behaviourally identical to the previous
+/// implementation on this machine, where no scoring service has ever run.
+///
+/// **Why the HTTP client is gone.** This handler was the only code in the host
+/// that could open a network connection, and it existed to reach a phishing-URL
+/// model that is out of scope for Aegis (a separate project) and whose trained
+/// weights are not in this repository. Carrying `reqwest` for it cost 126 of
+/// the crate's 290 dependency edges, including one already flagged unmaintained
+/// by `cargo audit` (RUSTSEC-2025-0134, `rustls-pemfile`).
+///
+/// A file scanner with no outbound network path is a materially better thing
+/// to have on a machine than one with an HTTP stack it does not use: there is
+/// no connection for a compromised host process to make, and no TLS stack in
+/// the dependency tree to inherit advisories from. Restoring the call is a
+/// dozen lines if Layer 1 is ever built — see DECISIONS.md.
+///
+/// Layer 1 fails OPEN, deliberately and unlike everything else here: a hover
+/// badge is advisory, and browsing must not break because a scorer is absent.
+/// The file pipeline fails closed. That asymmetry is intentional.
+async fn handle_url_check(msg: &Value) -> Result<()> {
+    if msg.get("url").and_then(|v| v.as_str()).is_none() {
+        native_messaging::send_verdict("REJECTED_MALFORMED", "CHECK_URL missing 'url'", None)?;
         return Ok(());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(cfg.ml.timeout())
-        .build()
-        .context("Failed to build HTTP client")?;
-
-    let response = client
-        .post(&cfg.ml.service_url)
-        .json(&serde_json::json!({ "url": url }))
-        .send()
-        .await;
-
-    match response {
-        Ok(resp) => {
-            let body: Value = resp
-                .json()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({"score": 0.5, "label": "unscored"}));
-
-            // Validate response schema before trusting it
-            let score = body.get("score").and_then(|v| v.as_f64()).unwrap_or(0.5);
-            let label = body
-                .get("label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unscored")
-                .to_string();
-
-            // Clamp score to [0, 1]
-            let score = score.clamp(0.0, 1.0);
-
-            native_messaging::write_message(&serde_json::json!({
-                "type": "URL_SCORE",
-                "score": score,
-                "label": label,
-            }))?;
-        }
-        Err(e) => {
-            tracing::warn!("ML service unreachable: {} — failing open with unscored", e);
-            native_messaging::write_message(&serde_json::json!({
-                "type": "URL_SCORE",
-                "score": 0.5,
-                "label": "unscored",
-                "reason": "ML service unreachable"
-            }))?;
-        }
-    }
+    native_messaging::write_message(&serde_json::json!({
+        "type": "URL_SCORE",
+        "score": 0.5,
+        "label": "unscored",
+        "reason": "URL scoring is not part of this build",
+    }))?;
 
     Ok(())
 }

@@ -7,24 +7,30 @@ edition = "2021"
 name = "aegis-host"
 path = "src/main.rs"
 
+# Dependencies are kept deliberately few.
+#
+# Every crate here runs in a process that parses hostile input and can move
+# files into the user's Downloads folder, so the dependency tree is part of the
+# attack surface rather than an implementation detail. `reqwest` was removed
+# with the URL-scoring call it existed for: it accounted for more than half the
+# tree (187 crates -> 92), brought a TLS stack this program has no use for, and
+# carried the only advisory `cargo audit` reported. The host now has no
+# outbound network capability at all.
 [dependencies]
-tokio = { version = "1.45.1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
-reqwest = { version = "0.11", features = ["stream", "json"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-futures-util = "0.3"
 anyhow = "1.0"
-async-trait = "0.1"
 uuid = { version = "1.11", features = ["v4"] }
-base64 = "0.22"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
-# Win32_System_HostComputeSystem was removed with the HCS sandbox backend: HCS
-# needs the vmcompute service, which does not exist on Windows Home.
+# Authenticode verification is the only thing the Windows API is used for now.
+# The HCS sandbox backend and its Win32_System_HostComputeSystem feature were
+# removed (no vmcompute service on Windows Home), and the restricted-process
+# sandbox that replaced it was dropped in turn — see DECISIONS.md.
 windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",

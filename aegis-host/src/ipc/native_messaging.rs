@@ -23,8 +23,22 @@ pub const MAX_MESSAGE_BYTES: u32 = 1_048_576; // 1 MB
 /// Returns `Ok(Some(value))` on success.
 /// Returns `Err` on malformed input (length > MAX_MESSAGE_BYTES, invalid JSON, IO error).
 pub fn read_message() -> Result<Option<Value>> {
+    read_frame(&mut io::stdin().lock())
+}
+
+/// The frame parser, over any reader.
+///
+/// Split out from [`read_message`] so it can be tested and fuzzed against a
+/// buffer. It reads the first attacker-controlled bytes this process ever
+/// sees — a 4-byte length that decides an allocation — so "what does this do
+/// with hostile input" needs an answer that does not involve spawning a
+/// process and piping to it. See `tests/fuzz_parsers.rs`.
+///
+/// Behaviour is identical to reading stdin directly; `read_message` is now
+/// just this function bound to the real handle.
+pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Value>> {
     let mut len_buf = [0u8; 4];
-    match io::stdin().read_exact(&mut len_buf) {
+    match reader.read_exact(&mut len_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
             // Chrome closed the pipe — normal shutdown
@@ -37,7 +51,11 @@ pub fn read_message() -> Result<Option<Value>> {
 
     let length = u32::from_le_bytes(len_buf);
 
-    // Validate length BEFORE allocating — classic integer-overflow-into-OOM
+    // Validate length BEFORE allocating — classic integer-overflow-into-OOM.
+    //
+    // The ceiling is what stops `vec![0u8; length]` below from being a
+    // four-byte denial of service: without it, `FF FF FF FF` asks this process
+    // to reserve 4 GB before a single byte of the body has arrived.
     if length > MAX_MESSAGE_BYTES {
         bail!(
             "Incoming message length {} exceeds maximum allowed {} bytes — rejecting as malformed",
@@ -50,7 +68,7 @@ pub fn read_message() -> Result<Option<Value>> {
     }
 
     let mut json_buf = vec![0u8; length as usize];
-    io::stdin()
+    reader
         .read_exact(&mut json_buf)
         .context("Failed to read message body from stdin")?;
 

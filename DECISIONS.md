@@ -608,3 +608,310 @@ per the spec. The original files are not deleted but become dead code once the
 new binary is the canonical build target.
 
 Decision: rename existing `aegis/` → `aegis-host/` by rewriting in place.
+
+---
+
+# Phase 6 — Archive, Auto-execution, Authenticode; detonation dropped
+
+## Detonation dropped (supersedes every earlier sandbox decision)
+
+The restricted-process sandbox was started, then removed rather than finished.
+The HCS decision above explains why HCS could not work on this machine; this
+explains why its replacement was abandoned too.
+
+**Defender already does this, better and elsewhere.** Cloud-delivered protection
+with Block-at-First-Sight holds an unknown file while Microsoft's cloud actually
+detonates it, on Microsoft's hardware, with instrumentation and a malware corpus
+no local implementation can match.
+
+**A user-mode sandbox produces weak evidence.** A restricted process shares the
+Windows kernel. It contains commodity malware, but it does not stop a kernel
+exploit, and malware that fingerprints sandboxes simply behaves for the thirty
+seconds it is watched. The samples worth worrying about are exactly the ones it
+tells you least about.
+
+**Building it means running unknown malware on the user's own machine** to
+obtain that weak evidence. The half-built implementation did not even block
+network access.
+
+**The decisive argument is what it would replace.** With no detonation, an
+ambiguous file is simply not delivered — a safe default. A sandbox introduces a
+mechanism that can return `Clean`, and `decide_after_sandbox` mapped `Clean` to
+`Release`. Swapping a safe default for a mechanism that can release a file
+static analysis found suspicious is a net reduction in safety.
+
+**Authenticode does the same job better.** The purpose of the middle band is to
+resolve ambiguity. A binary signed by a real publisher resolves out of that band
+statically, with no execution and no risk.
+
+**Decision:** delete `src/sandbox/` entirely rather than leaving a stub. A stub
+implies a stage that is coming; its absence is the design. `Decision::Sandbox`
+is renamed `Decision::Inconclusive` for the same reason — the old name described
+a step that no longer exists, and the verdict text it produced
+(`Sandbox verdict: SUSPICIOUS. Behaviors: STUB...`) described the scanner's own
+unfinished state rather than anything about the user's file.
+
+Work preserved on `wip/phase4-restricted-sandbox`, unmerged.
+
+---
+
+## Archive inspection thresholds
+
+The largest detection gap: a ZIP containing `invoice.pdf.exe` scored **zero**.
+The container is a well-formed ZIP, its entropy is normal for compressed data,
+and `structure.rs` deliberately does not flag executables inside archives.
+
+**Parse the central directory, never decompress.** A ZIP records every entry
+twice; the central directory is the authoritative index. Reading it yields every
+name, size and flag for the cost of a seek. This is not only cheaper — a zip
+bomb cannot be triggered by a scanner that never inflates, and the ratio that
+identifies one is a header field.
+
+**Risk assignments, and the reasoning for each:**
+
+| Finding | Risk | Why |
+|---|---|---|
+| RLO in an entry name | 0.85 | No legitimate use. Reverses displayed extension. |
+| Zip-slip traversal | 0.80 | No archiver produces this. Never accidental. |
+| Double extension inside | 0.75 | The case this module exists for. |
+| Zip bomb | 0.60 | Both conditions required (below). |
+| Encrypted entries | 0.50 | Legitimate, but the standard AV-evasion move. |
+| Lone root executable | up to 0.70 | The delivery *shape*, not the content. |
+| Executable present | 0.15 | Reported, not accused. |
+
+**"Contains an executable" is deliberately near-zero.** An archive containing a
+program is what an installer *is*. Flagging it would fire on every software
+download and destroy the signal-to-noise ratio. A test asserts an ordinary
+installer archive stays below `sandbox_threshold`; if that test ever fails, the
+check has become a false-positive generator.
+
+**Zip bombs require BOTH a ratio >= 100:1 AND >= 1 GB expanded.** Ratio alone is
+a false-positive machine — a 10 KB file of zeros compresses about 1000:1 and is
+entirely harmless. Absolute size alone flags every large legitimate archive. It
+is the combination, enormous expansion from almost nothing, that has no benign
+explanation.
+
+**Encrypted entries are reported but not decisive.** People do legitimately
+password-protect archives. But nothing can scan inside one — not Aegis, and not
+Defender either — which is precisely why malware campaigns ship them with the
+password in the email body: it moves decryption to a human, past every automated
+check. Reported as *unscannable*, never as *clean*.
+
+---
+
+## Auto-execution surface
+
+Directly on the stated goal: stop files that execute on arrival.
+
+**Extension weights are relative to how directly the format runs.** `.exe` is
+0.15 inside an archive (installers are normal) while `.lnk` is 0.6, because a
+shortcut carries an arbitrary command line behind any icon it likes and has no
+reason to arrive in a download. Encoded script variants (`.jse`, `.vbe`) score
+above their plain forms: encoding serves no purpose except concealment.
+
+**Macros are judged against the declared format.** `vbaProject.bin` inside a
+`.docm` is reported and not condemned — the user asked for a macro-enabled
+document. The same stream inside a `.docx` is Critical, because that format is
+macro-free by definition and the mismatch is deliberate.
+
+---
+
+## Authenticode: MAX_TRUST_CREDIT = 0.25, withheld on serious findings
+
+The first and only signal that can *lower* a score, which makes it the first one
+an attacker would want to trigger.
+
+**Capped at 0.25** — enough to move a file from the inconclusive band to
+release, nowhere near enough to rescue one that tripped a real detection.
+
+**Withheld entirely when any Critical or High finding is present.** This is the
+load-bearing rule. Without it, signing your malware buys down a real detection:
+a packed dropper with a stolen certificate would score *lower* than the same
+dropper unsigned, inverting the point of the check. A signature can settle an
+ambiguous file; it can never argue away a strong one.
+
+**A broken signature scores 0.8.** `TRUST_E_BAD_DIGEST` means the bytes changed
+after signing. Unlike a valid signature, this has no innocent explanation.
+
+**No revocation checking** (`WTD_REVOKE_NONE`, `WTD_CACHE_ONLY_URL_RETRIEVAL`).
+Fetching CRLs and OCSP responses would stall a download for an unbounded time
+and make the scanner behave differently online and offline. **The cost is that a
+revoked certificate still verifies** — which is a third reason the credit is
+small, and belongs in the docs rather than being quietly accepted.
+
+**Catalog signing is checked**, because most Windows system binaries carry no
+embedded signature and an embedded-only check reports `notepad.exe` as unsigned.
+
+---
+
+## Score combination: max across the new analyses too
+
+`whole_file_scan` already took the maximum of structure/entropy/PE because those
+overlap. Archive, auto-execution and signature analysis genuinely do *not*
+overlap with them — they read the ZIP index, the filename and the certificate
+respectively — so summing would be defensible.
+
+**Max was chosen anyway, for a different reason.** Every check that identifies a
+real attack is already calibrated to be decisive alone (0.7–0.85). The weak ones
+— "this archive contains a program", "this document has a macro" — are weak
+precisely because they are common and usually benign. Summing those is how a
+legitimate installer accumulates its way past the block threshold, and a false
+positive on ordinary software costs more than the compound case buys.
+
+---
+
+## Quarantine hardening was protecting the wrong directory
+
+**Found while removing dead code, not by a test.** Phase 1 held samples in
+`<temp>/aegis_quarantine/` and that is what `apply_windows_acl` locked down.
+Phase 2 moved them to `<Downloads>/aegis_quarantine/`, created with a bare
+`create_dir_all`. So the carefully secured directory held nothing, and the
+directory holding every live sample inherited whatever permissions the user's
+Downloads folder carried.
+
+DECISIONS.md item 5 claimed a property the code no longer had on the path that
+mattered — exactly the documentation drift this file exists to prevent.
+
+**Decision:** `Quarantine::secure` takes the path explicitly rather than
+deriving it, so there is one way to name that directory and one place that locks
+it. Applied per session as well as at start-up, because anything can delete the
+directory between sessions and a recreated one would inherit Downloads'
+permissions again.
+
+---
+
+## The retired chunk protocol was still reachable
+
+`handle_download_session` (~400 lines) served `START_DOWNLOAD`/`CHUNK`, which the
+extension has not sent since Phase 2. It was unreachable in practice and still
+carried the **pre-Phase-2 policy**: its `Release` branch told the extension to
+perform the download itself, which is the TOCTOU architecture Phase 2 existed to
+remove.
+
+**Decision:** delete it, and refuse both message types explicitly rather than
+letting them fall through to "unknown message type". If a future extension ever
+regressed to sending `START_DOWNLOAD`, the worst outcome would be the host
+quietly accepting it.
+
+Six integration tests were exercising that protocol. **Three of them were
+passing only because every chunk was now rejected** — green for the wrong
+reason, which is worse than red. Rewritten against the live path.
+
+---
+
+## No HTTP client, and no network capability at all
+
+`cargo audit` (run for the first time) reported RUSTSEC-2025-0134,
+`rustls-pemfile` unmaintained, reached only through `reqwest` — which existed
+for a single call forwarding URLs to a phishing model that is **out of scope for
+Aegis** and whose weights are not in this repository.
+
+**Decision:** remove it. `CHECK_URL` still answers, with `unscored` — identical
+to its behaviour on any machine where no scoring service runs, which is every
+machine so far, and the extension already renders that as a neutral badge.
+
+```
+dependencies   187 -> 92 crates
+cargo audit    1 advisory -> clean
+network        no outbound capability at all
+```
+
+The last line is the real gain. A file scanner with no network stack is a better
+thing to have on a machine than one carrying an HTTP client it does not use.
+
+Also dropped `futures-util`, `async-trait`, `tokio-util` and `base64` (zero uses
+after the chunk protocol went), and narrowed `tokio` from `"full"` to the five
+features actually used. The dependency tree of a process that parses hostile
+input and writes into Downloads is attack surface, not an implementation detail.
+
+---
+
+## Filename sanitisation: safety without an ASCII allowlist
+
+`sanitize_filename` replaced every character outside `[A-Za-z0-9._-]` with `_`.
+Safe — and it turned `Résumé.pdf` into `R_sum_.pdf`, `report (final).pdf` into
+`report__final_.pdf`, and any filename not written in English into a row of
+underscores. Aegis is supposed to be invisible when a file is fine.
+
+**Safety never required an allowlist, only that specific characters go.** Now
+removed by name: separators and `..`, control characters, the characters Windows
+forbids (`:` most of all — `notes.txt:payload.exe` is an NTFS alternate data
+stream), trailing dots and spaces (Windows strips them, so `evil.exe.` opens as
+`evil.exe`), and bidirectional overrides.
+
+That last one closed a real gap: `archive.rs` reports U+202E inside a ZIP as
+Critical, but nothing stopped the identical trick surviving into a *released*
+filename, where no check looks for it.
+
+**The doubled extension in HANDOVER 6.6 is not a bug.** Chromium chooses that
+name from the response MIME type; reproducing it is what the user would have got
+without Aegis. Documented rather than "fixed".
+
+---
+
+## The prototype was a malware executor
+
+`aegis/src/hcs.rs` contained `start_behavioral_scan`, which renamed the
+downloaded file to `sandbox_exec.exe` and ran it via `Command::spawn` with **no
+isolation of any kind**: full user token, full privileges, network reachable, no
+job object, no integrity drop. Its scoring could not reach its own threshold
+(maximum 10, tested `> 10`), so it executed malware and then reported clean.
+
+Unreferenced by any build, but 22 MB of loaded gun in the repository. Having
+just declined to build an *isolated* sandbox on the grounds that running malware
+locally is a bad trade, keeping an unisolated one was indefensible.
+
+**Decision:** deleted. Along with `test_memory.py`, `test_trojan_file.py` and
+`test_ipc.py`, all three of which drove the retired protocol.
+
+---
+
+## Fuzzing: mutation harness, not cargo-fuzz
+
+Spec §4 requires fuzzing. Coverage-guided fuzzing is strictly better at finding
+deep bugs and needs a nightly toolchain plus libFuzzer, which is awkward on
+Windows/MSVC.
+
+**Decision: an in-repo deterministic mutation harness**, for two reasons.
+
+These parsers are days old, so the bugs still in them are the shallow ones — a
+forgotten bounds check, a trusted length — and blind mutation finds those
+readily. Coverage guidance earns its keep on mature parsers.
+
+And a `cargo-fuzz` run is an event someone has to remember to repeat. This runs
+on every `cargo test`, and any parser added later is covered by adding one line
+to `TARGETS`.
+
+**The oracle is "no panic AND finished inside a time budget."** Hangs matter as
+much as crashes: every parser bounds its loops, and a wrong bound means a
+crafted file spins while the download sits open forever.
+
+**Why a panic is not an ordinary crash here.** The host dying drops the native
+messaging port; the extension correctly reads that as "cannot verify" and
+cancels. So one crafted file does not infect anyone — it fails safe — but it
+stops *every download on the machine* until the user works out why. That is a
+denial of service triggered by a single download, and it is why §4 forbids
+panics on any path.
+
+41,200 cases per run. The one bug it found was in a test of mine, which had
+asserted `is_err()` on a partial length prefix while its own comment said
+"disconnect".
+
+---
+
+## Findings on the release path
+
+`send_final_verdict` carried no findings, so for any file that **passed** the
+user saw nothing. That made "Signed by Microsoft Corporation" unreachable: a
+signed file is released, so it never touches a block path, and the entire
+user-visible payoff of Authenticode could never be delivered.
+
+**Decision:** releases carry findings too, plus a provenance clause naming the
+signer. An unsigned executable is called out on release as well — it passed, and
+the user is about to run something whose origin nobody can vouch for, which is a
+fact about the file rather than an accusation against it.
+
+The popup labels the section by outcome — "Notes on this file" when delivered,
+"Why this was not delivered" when not — because rendering a signature
+identically to a block reason would make every cleared download look like a near
+miss.

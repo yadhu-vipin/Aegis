@@ -1,175 +1,146 @@
 # Aegis — Handover
 
-> **This file is descriptive, not aspirational.** Every claim here was verified by
-> running the code. The older `CLAUDE_CODE_HANDOVER.md` at the repo root is the
-> opposite — it describes an intended design and asserts work that was never done.
-> Trust this file; treat that one as a design sketch.
+> **This file is descriptive, not aspirational.** Every claim here was verified
+> by running the code.
 
-**Read first:** this file, then `DECISIONS.md` (the audit trail of every
-assumption and fail-open/fail-closed call). `AEGIS_BUILD_SPEC.md` is the
-original spec — still useful for intent, but the architecture has since changed
-in ways it does not reflect (see "Architecture" below).
-
----
-
-## 1. What the project is, and what it is NOT
-
-Aegis is a browser download broker. **Nothing reaches the user's Downloads
-folder until it has been scanned and cleared.**
-
-The goal, in the owner's words: *"not let files into the system which start
-executing stuff as soon as it's downloaded."* It is **added security alongside
-Windows Defender, not a replacement.** That framing matters — it decides what is
-worth building. Aegis does not need its own signature database, cloud lookups,
-or kernel driver. Defender has those. Aegis contributes two things Defender
-structurally cannot:
-
-1. **Pre-completion interception.** Defender's on-write scanner acts once bytes
-   are on disk. Aegis scans as they arrive and cancels the download mid-flight.
-2. **A hard quarantine boundary.** The file is never in the user's Downloads
-   folder at any point unless it passed.
-
-Layer 1 (URL/phishing ML) is a separate project and **explicitly out of scope**.
+**Read first:** [README.md](README.md) for what Aegis is and is not, then
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works, then
+[DECISIONS.md](DECISIONS.md) for the audit trail of every threshold and
+fail-open/fail-closed call. `AEGIS_BUILD_SPEC.md` is the original spec and is
+**historical** — its architecture is not the one that exists; it carries a
+banner saying so.
 
 ---
 
-## 2. Current state — VERIFIED WORKING
+## 1. Current state
 
-The full pipeline runs end to end against real Microsoft Edge. Evidence from
-`aegis-host/target/debug/aegis-host.log`:
+**Working end to end against real Microsoft Edge.**
 
 ```
-# Executable renamed test_trojan.jpg
-Magic byte scan detected="exe" claimed=jpeg
-Intent flag "CreateRemoteThread" risk=0.6
-Quarantined file discarded reason="early block"      <- never reached Downloads
+351 tests passing
+  125  unit
+  103  fuzz (41,200 mutation cases per run)
+   12  IPC round-trip against the real binary
+  107  against containers written by real Windows tools
+    4  sample-based
 
-# Legitimate 177 KB PDF
-Download scan complete risk_score=0.0 decision=RELEASE bytes=177509
-File released to Downloads to=...\IntroToObfuscation_Notes.pdf
+cargo clippy --all-targets -- -D warnings   clean
+cargo audit                                 clean (92 crates)
 ```
 
-**86 tests passing** (69 unit + 13 integration + 4 doc). `cargo clippy
---all-targets -- -D warnings` clean.
+### Complete
 
-### Done
-
-| Phase | What | State |
-|---|---|---|
-| 1 | Fail-closed fixes, HCS removal, native-host registration | done |
-| 2 | Interception re-architecture, watcher, release broker | done, verified in Edge |
-| 3 | UTF-16 intent, structure, entropy, PE + IAT, explained findings | done |
-
-### Not done
-
-| Phase | What |
+| Area | State |
 |---|---|
-| 4 | Restricted-process sandbox (`windows_restricted.rs` is a fail-closed stub) |
-| 5 | `cargo audit`, fuzz targets, `ARCHITECTURE.md`, popup polish |
+| Interception, quarantine, release broker | done, verified in Edge |
+| Streaming scan + early kill | done, verified in Edge |
+| Magic bytes, intent (UTF-8 + UTF-16LE) | done |
+| Structure, entropy, PE + import table | done |
+| Archive inspection (ZIP central directory) | done |
+| Auto-execution surface (LNK, macros, autorun) | done |
+| Authenticode + catalog signing | done |
+| Fuzzing, `cargo audit`, dependency reduction | done |
+| Documentation | done |
+
+### Deliberately not built
+
+**Detonation / sandboxing.** Removed, not deferred. A user-mode sandbox shares
+the kernel, tells you least about the samples that matter, and would require
+running unknown malware on the user's own machine — to replace a safe
+fail-closed default with a mechanism that can return "clean". Defender already
+detonates unknown files in Microsoft's cloud. Full reasoning in DECISIONS.md
+("Detonation dropped"); abandoned code on `wip/phase4-restricted-sandbox`.
+
+**Layer 1 (URL/phishing ML).** A separate project. The host makes no network
+requests at all.
+
+### Not yet done
+
+- **End-to-end verification of the new checks in a live browser.** The archive,
+  auto-execution and signature checks are covered by unit, integration and
+  real-container tests, but have not been driven through Edge by an actual
+  download. Given this project's history that is the verification that counts —
+  see §4.
+- **No licence chosen.**
+- **`install_native_host.sh`** (Linux) is untested against the current layout.
 
 ---
 
-## 3. Architecture (as built — differs from AEGIS_BUILD_SPEC.md)
-
-```
-downloads.onDeterminingFilename
-   -> suggest "aegis_quarantine/{uuid}.aegispart"
-   -> Chrome does the ONE fetch (keeps cookies, session, POST, one-time tokens)
-        |
-        v
-<Downloads>/aegis_quarantine/{uuid}.<ext chosen by Chrome>
-        |
-   extension --WATCH_BEGIN--> native host (com.aegis.sandbox)
-        |
-   host tails the growing file:
-     magic bytes (first span) + intent strings (every span, UTF-8 AND UTF-16LE)
-     score >= block_threshold  ->  EARLY_BLOCK  ->  downloads.cancel()
-        |
-   on completion: whole-file pass (structure, entropy, PE/IAT)
-        |
-   risk::decide() -> Release | Sandbox | Block
-        |
-   release.rs: move to Downloads, or delete
-```
-
-**Why not stream bytes from the extension?** Chrome exposes no API for a
-download's byte stream. The only way an extension can supply bytes is to fetch
-the URL a *second* time — which doubles bandwidth, breaks POST/token/auth
-downloads, and means the bytes scanned are not the bytes delivered. The original
-design did exactly that. Do not go back to it.
-
-**Quarantine lives under Downloads** because `onDeterminingFilename` only
-accepts paths relative to the default download directory. Absolute paths and
-`..` are rejected by Chrome. This is a constraint, not a preference.
-
----
-
-## 4. Things that WILL waste your time if you don't know them
+## 2. Things that WILL waste your time if you don't know them
 
 These each cost hours. All verified.
 
-1. **The browser is Microsoft Edge, not Chrome.** Chrome is not installed.
-   Each Chromium browser reads native-host registrations only from its own
-   registry hive. `scripts/install_native_host.ps1` handles all of them.
+1. **The browser is Microsoft Edge, not Chrome.** Chrome is not installed. Each
+   Chromium browser reads native-host registrations only from its own registry
+   hive. `scripts/install_native_host.ps1` handles all of them.
 
 2. **The live host is `aegis-host/target/debug/aegis-host.exe`.** The manifest
    in play is `extension/native-messaging/com.aegis.sandbox.json`, which points
    directly at the build output — so `cargo build` makes changes live with no
-   reinstall. **Its log is `aegis-host/target/debug/aegis-host.log`.** Copies at
-   `C:\Aegis\` and `%LOCALAPPDATA%\Aegis\` are unused debugging leftovers.
-   Reading the wrong log cost most of one session.
+   reinstall. **Its log is `aegis-host/target/debug/aegis-host.log`.** Reading
+   the wrong log cost most of one session.
 
-3. **Chrome rewrites the file extension.** You suggest `{uuid}.aegispart`;
-   Chromium re-applies its own extension from the MIME type, so a PDF lands as
-   `{uuid}.pdf`. `validate_quarantine_path` therefore validates a **UUID stem**,
-   never the extension.
+3. **Chromium rewrites the file extension.** You suggest `{uuid}.aegispart`;
+   the browser re-applies its own extension from the MIME type, so a PDF lands
+   as `{uuid}.pdf`. `validate_quarantine_path` therefore validates a **UUID
+   stem**, never the extension. This also explains the doubled names in released
+   files (`test_trojan.jpg` → `test_trojan.jpg.jpeg`) — that is the browser's
+   own naming, faithfully reproduced, and not a bug.
 
 4. **Windows 11 Home has no Hyper-V.** `vmcompute` does not exist. HCS was
    removed for this reason and should not come back.
 
-5. **Defender wins the race on known malware.** It quarantines EICAR in our
-   quarantine dir before we can read it (`os error 225`). Handled as a normal
-   BLOCK. Do **not** add a Defender exclusion for the quarantine directory —
-   that would disable real-time protection on the one folder guaranteed to
-   contain live malware. **Do not use EICAR in on-disk tests**; you will measure
-   Defender, not Aegis.
+5. **Defender wins the race on known malware.** It quarantines EICAR in the
+   quarantine directory before we can read it (`os error 225`), handled as a
+   normal BLOCK naming Defender. Do **not** add a Defender exclusion for that
+   directory — it would disable real-time protection on the one folder
+   guaranteed to contain live malware. **Do not use EICAR in on-disk tests**;
+   you will measure Defender, not Aegis.
 
 6. **PowerShell 5.1 reads BOM-less `.ps1` as ANSI.** A single em-dash in a
-   string literal produces nine cascading parse errors pointing nowhere near
-   the real problem. Keep `.ps1` files pure ASCII.
+   string literal produces nine cascading parse errors pointing nowhere near the
+   real problem. Keep `.ps1` files pure ASCII.
 
 7. **PowerShell needs `$env:LOCALAPPDATA`, not `$LOCALAPPDATA`.** The bash form
-   silently resolves to `C:\Aegis\...`.
+   silently resolves to a wrong path.
 
 8. **Execution policy blocks scripts.** Use
    `powershell -ExecutionPolicy Bypass -File .\scripts\<name>.ps1`.
 
+9. **Quoted heredocs in this environment mangle escape sequences.** Writing Rust
+   containing `\x89` through `cat <<'EOF'` produced UTF-8-encoded U+0089 and a
+   file `grep` reported as binary. Use the editor tools for source files.
+
 ---
 
-## 5. Key files
+## 3. Key files
 
 ```
 aegis-host/src/
-  main.rs          native-messaging loop; handle_watch_session(); trust-boundary
-                   path validation (validate_quarantine_path)
+  main.rs          message loop; handle_watch_session(); validate_quarantine_path()
   watcher.rs       tails the growing download, early-kill logic, bounded memory
-  release.rs       the ONLY path into Downloads; collision handling; stale sweep
-  quarantine.rs    temp dir, ACL, disk guard, filename sanitisation
-  risk/mod.rs      decide() / decide_after_sandbox() / aggregate_risk()
-  config.rs        aegis.toml loading; fails fast, never silently defaults
-  ipc/native_messaging.rs   4-byte LE framing, 1 MB bound, verdict senders
+  release.rs       the ONLY path into Downloads; collisions; stale sweep
+  quarantine.rs    directory hardening (ACL / 0700), filename sanitisation
+  risk/mod.rs      decide(): Release | Inconclusive | Block
+  config.rs        aegis.toml; fails fast, never silently defaults
+  ipc/native_messaging.rs   4-byte LE framing, 1 MB bound, read_frame(impl Read)
   scanner/
-    mod.rs         deep_forensic_scan (per-span) + whole_file_scan + combine
+    mod.rs         deep_forensic_scan (per-span) + whole_file_scan_at + combine
     finding.rs     Finding { severity, title, detail, why } - the explanation layer
     magic_bytes.rs type vs extension
-    intent.rs      red-flag strings, UTF-8 AND UTF-16LE
+    intent.rs      red-flag strings, UTF-8 AND UTF-16LE at both alignments
     structure.rs   polyglots, trailing data, double extensions
-    entropy.rs     Shannon entropy, packing/encryption detection
-    pe.rs          PE sections, packers, entry point, AND import-table (IAT) analysis
-  sandbox/
-    mod.rs         Sandbox trait, Verdict
-    windows_restricted.rs   PHASE 4 STUB - always Suspicious, never executes
-    linux_stub.rs  dev stub
+    entropy.rs     Shannon entropy, packing/encryption
+    pe.rs          sections, packers, entry point, import table
+    archive.rs     ZIP central directory (+ZIP64); zip-slip, RLO, bombs
+    autoexec.rs    LNK command lines, OOXML/OLE macros, autorun.inf, .url
+    signature.rs   Authenticode + catalog; apply_trust_credit()
+
+aegis-host/tests/
+  ipc_roundtrip.rs    real binary over a real pipe
+  fuzz_parsers.rs     41,200 mutation cases; no panic AND no hang
+  real_containers.rs  archives written by Compress-Archive, Explorer shortcuts
+  scanner_samples.rs  the files in test_files/
 
 extension/
   background.js    onDeterminingFilename redirect, session persistence,
@@ -180,97 +151,77 @@ extension/
 scripts/
   install_native_host.ps1      all Chromium browsers, validates extension ID
   verify_native_host.ps1       walks the chain, names the broken link
-  diagnose_native_messaging.ps1  captures browser-side native messaging logs
+  diagnose_native_messaging.ps1  captures browser-side logs
+  serve_test_downloads.py      local file server for end-to-end testing
 ```
 
 ---
 
-## 6. What remains — "the final nail"
-
-Ordered by value **to the stated goal** (stop files that auto-execute), not by
-the original spec order.
-
-### 6.1 Archive inspection — HIGHEST VALUE, NOT YET STARTED
-
-The largest remaining gap. A `.zip` containing `invoice.pdf.exe` currently
-scores ~0: `structure.rs` deliberately does not flag executables inside
-archives (a ZIP legitimately contains them), and the scanner never looks
-*inside*. Most malware arrives this way.
-
-Parse the ZIP central directory (no decompression needed for the listing) and
-run the existing filename checks on each entry. Flag: executable entries,
-double extensions inside, path traversal in entry names (zip-slip), and
-compression ratios consistent with a zip bomb. `structure.rs` already locates
-the EOCD record, so the hard part is done.
-
-### 6.2 Authenticode signature check — HIGH VALUE, CHEAP
-
-"Is this signed, and by whom" is the single strongest legitimacy signal, and
-it is why Defender treats a Microsoft-signed binary differently from an unknown
-one. `WinVerifyTrust` via the `windows` crate. A valid signature from a known
-publisher should *reduce* risk; an invalid or absent one on an executable
-should raise it slightly.
-
-### 6.3 Auto-execution surface — DIRECTLY ON GOAL
-
-The stated purpose is stopping files that execute on arrival. Enumerate what
-actually achieves that on Windows and check for each: `.lnk` shortcuts with
-embedded commands, Office macros (`vbaProject.bin` inside OOXML), `.scr`,
-`.hta`, `.iso`/`.img` (mount-and-autorun), `autorun.inf`, and `.url`/`.website`
-files. Several are just filename and container checks on top of 6.1.
-
-### 6.4 Phase 4 — restricted-process sandbox
-
-`CreateRestrictedToken` + Low integrity + Job Object (`KILL_ON_JOB_CLOSE`) +
-separate desktop + no network + hard timeout. Design is in `DECISIONS.md`.
-
-**Be honest about what this buys.** It shares the kernel; a kernel exploit
-escapes it, and sandbox-aware malware behaves while watched. It is *corroborating
-evidence for the ambiguous middle band*, not the main protection. The main
-protection is Phases 2–3. Say so in `ARCHITECTURE.md`; do not let the popup
-claim "verified safe" on a clean restricted detonation.
-
-Execution stays gated: files already above `block_threshold` are blocked
-statically and never run.
-
-### 6.5 Phase 5 — ship quality
-
-- `cargo audit` (never run — do this)
-- `cargo fuzz` on `deep_forensic_scan` and the frame parser (spec §4 requires it)
-- `ARCHITECTURE.md`: real diagram + an honest "how this differs from Defender"
-- Popup polish; surface the health banner more prominently
-
-### 6.6 Known smaller issues
-
-- Chrome's extension rewriting can produce doubled names on release
-  (`test_trojan.jpg` -> `test_trojan.jpg.jpeg`). Cosmetic.
-- `scripts/test_memory.py`, `test_trojan_file.py`, `serve_test_downloads.py`
-  still assume Linux paths; the IPC one was ported to Rust.
-- `aegis/` (the old prototype) is dead code and should be deleted. It contains
-  a `Command::spawn()` on downloaded files — a malware executor, not a sandbox.
-
----
-
-## 7. How to work on this
+## 4. How to work on this
 
 ```bash
 cd aegis-host
-cargo test                                   # 86 tests
+cargo test
 cargo clippy --all-targets -- -D warnings
-cargo build                                  # makes changes LIVE (see §4.2)
+cargo build                                  # makes changes LIVE (see §2.2)
 ```
 
-Then reload the extension at `edge://extensions` and download something.
-Check `aegis-host/target/debug/aegis-host.log`.
+Then reload the extension at `edge://extensions` and download something. Check
+`aegis-host/target/debug/aegis-host.log`.
 
-**Standing rule for this project: run it, don't just read it.** Every real bug
-here has been invisible to code review — log output corrupting the protocol
-stream, a filename the browser silently rewrote, a registry hive for a browser
-that was not installed. When you fix a silent failure, add a test that would
-have caught it.
+For end-to-end testing:
 
-**Fail closed.** Ambiguity blocks. If Aegis cannot verify something, the file
+```bash
+python scripts/serve_test_downloads.py
+```
+
+**Standing rule: run it, don't just read it.** Every real bug here has been
+invisible to code review — log output corrupting the protocol stream, a filename
+the browser silently rewrote, a registry hive for a browser that was not
+installed, quarantine hardening applied to a directory nothing used. When you
+fix a silent failure, add a test that would have caught it.
+
+**Fail closed.** Ambiguity holds the file. If Aegis cannot verify something, it
 does not get released — and the UI must say Aegis failed rather than implying
 the file is dangerous (`isInfrastructureFailure` in `background.js`).
 
+**Watch the false-positive side.** Several tests assert that ordinary files are
+*released*. A scanner that blocks everything is indistinguishable from a broken
+one, and every new check is a fresh chance to start rejecting legitimate
+downloads. If `ordinary_installer_archive_stays_below_the_sandbox_threshold` or
+`ordinary_archive_is_still_released` ever fails, something has become a
+false-positive generator.
+
 **Update `DECISIONS.md`** with every threshold and fail-open/fail-closed call.
+
+---
+
+## 5. Suggested next steps
+
+Ordered by value to the stated goal — stop files that auto-execute.
+
+1. **Drive the six cases in §6 through a real browser.** Highest value, lowest
+   effort, and the one form of verification this project has repeatedly shown to
+   be irreplaceable.
+2. **RAR and 7z listings.** `archive.rs` covers ZIP (and therefore OOXML, JAR,
+   APK, and every Office document). RAR and 7z are the obvious gap, and both
+   have parseable headers.
+3. **MSI / OLE structured storage.** `autoexec.rs` detects legacy OLE macros by
+   signature; walking the directory stream properly would also cover MSI custom
+   actions, which execute on install.
+4. **A licence.**
+
+---
+
+## 6. End-to-end checklist
+
+| Sample | Expected |
+|---|---|
+| A benign PDF | RELEASE, reaches Downloads |
+| A signed installer (e.g. from Microsoft) | RELEASE, publisher named in the popup |
+| A ZIP containing `invoice.pdf.exe` | BLOCK, names the disguised entry |
+| A password-protected ZIP | flagged unscannable, not silently cleared |
+| A `.docm` with a macro | flagged, explains the auto-execution risk |
+| An ordinary source-code ZIP | RELEASE — the false-positive check that matters most |
+
+Do **not** use EICAR (see §2.5).

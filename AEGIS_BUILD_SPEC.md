@@ -1,5 +1,27 @@
 # AEGIS — Build Specification
 
+> ## ⚠️ HISTORICAL DOCUMENT — DO NOT BUILD FROM THIS
+>
+> This is the **original** specification, kept for its statement of intent and
+> for the secure-coding rules in §4, which still apply. **The architecture it
+> describes is not the architecture that exists.**
+>
+> Superseded by reality:
+>
+> | This spec says | What was actually built | Why |
+> |---|---|---|
+> | Extension streams bytes to the host in 256 KB chunks | The browser writes to a quarantine directory; the host tails it | Re-fetching meant the bytes scanned were not the bytes delivered (TOCTOU), and it broke POST/token/auth downloads |
+> | HCS micro-container detonation | No detonation at all | HCS needs `vmcompute`, absent on Windows Home; its replacement was dropped deliberately |
+> | Layer 1 URL/ML scoring service | Out of scope; no network calls | Separate project; weights were never present |
+> | Quarantine under system temp | Under the user's Downloads folder | `onDeterminingFilename` only accepts paths relative to the download directory |
+>
+> **For what exists now, read in this order:**
+> [README.md](README.md) → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) →
+> [DECISIONS.md](DECISIONS.md) → [HANDOVER.md](HANDOVER.md).
+
+<details>
+<summary>Original preamble (obsolete instructions)</summary>
+
 > **How to use this file:** Drop this at the repo root as `AEGIS_BUILD_SPEC.md`. Then give your agent (Claude Code / Cursor / Antigravity) this single prompt:
 >
 > ```
@@ -11,6 +33,8 @@
 > ```
 >
 > That's the only prompt you need. Everything the agent needs to build this end-to-end is below.
+
+</details>
 
 ---
 

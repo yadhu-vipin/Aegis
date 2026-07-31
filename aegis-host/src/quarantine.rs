@@ -1,17 +1,33 @@
-//! Quarantine file management.
+//! Quarantine directory hardening.
 //!
-//! All files are held in `<system_temp>/aegis_quarantine/` under UUID-prefixed names.
-//! - Filenames from the browser are sanitized before use (cosmetic only; UUID is the
-//!   load-bearing path component).
-//! - Disk-space guard prevents starting a download that would exhaust the temp volume.
-//! - On Unix: `0700` permissions on the quarantine dir.
-//! - On Windows: Restrictive ACL (Aegis service account only) — see `apply_windows_acl`.
+//! The quarantine directory holds live, unscanned, potentially malicious files
+//! for the whole time they are being examined. This module makes it as hostile
+//! a place to tamper with as the platform allows:
+//!
+//! - On Unix: `0700`.
+//! - On Windows: inheritance stripped, full control granted to exactly one
+//!   principal — see [`apply_windows_acl`].
+//!
+//! **Which directory this is matters, and it moved.** Phase 1 held samples in
+//! `<system_temp>/aegis_quarantine/`, so that is what this module used to
+//! secure. Phase 2 moved them to `<Downloads>/aegis_quarantine/`, because
+//! Chrome's `onDeterminingFilename` only accepts paths relative to the default
+//! download directory — but the hardening was left pointing at the temp path.
+//! The result was a directory that was carefully locked down and never used,
+//! next to one that held every live sample and inherited whatever permissions
+//! the user's Downloads folder happened to carry.
+//!
+//! [`Quarantine::secure`] therefore takes the path explicitly rather than
+//! deriving it. There is now one way to name that directory and one place that
+//! locks it.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
-/// Manage a quarantine directory and produce safe file paths.
+/// A quarantine directory that exists and has been locked down.
+///
+/// Holding one of these is evidence the directory was secured: it cannot be
+/// constructed without [`Quarantine::secure`] succeeding.
 #[derive(Debug, Clone)]
 pub struct Quarantine {
     dir: PathBuf,
@@ -25,9 +41,16 @@ static WINDOWS_RESERVED: &[&str] = &[
 ];
 
 impl Quarantine {
-    /// Create (idempotently) the quarantine directory.
-    pub fn new(subdir: &str) -> Result<Self> {
-        let dir = std::env::temp_dir().join(subdir);
+    /// Create the quarantine directory if needed, then lock it down.
+    ///
+    /// Idempotent: safe to call on every host start-up and on every session.
+    ///
+    /// FAIL CLOSED — the caller must propagate an error from this rather than
+    /// carrying on. A directory of untrusted samples that could not be secured
+    /// is one where an attacker may be able to swap a file between the scan and
+    /// the verdict, which turns a clean result into a lie.
+    pub fn secure(dir: &Path) -> Result<Self> {
+        let dir = dir.to_path_buf();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create quarantine dir: {}", dir.display()))?;
 
@@ -43,57 +66,13 @@ impl Quarantine {
         #[cfg(windows)]
         apply_windows_acl(&dir)?;
 
-        tracing::info!("Quarantine directory ready: {}", dir.display());
+        tracing::info!("Quarantine directory secured: {}", dir.display());
         Ok(Self { dir })
     }
 
-    /// Check if the quarantine volume has enough free space for a download.
-    ///
-    /// `content_length`: bytes the server claims the file will be, or `None`
-    /// if unknown (Content-Length header absent).
-    ///
-    /// Returns `Ok(())` if safe to proceed, `Err` if the disk is too full.
-    pub fn check_space(&self, content_length: Option<u64>, max_accept_bytes: u64) -> Result<()> {
-        let expected = content_length.unwrap_or(max_accept_bytes);
-
-        let free = available_space(&self.dir)?;
-        // Require 2× the expected size as headroom (we write to a temp file
-        // and may also be running concurrent downloads).
-        let required = expected.saturating_mul(2).max(1_048_576); // at least 1 MB
-
-        if free < required {
-            bail!(
-                "REJECTED_INSUFFICIENT_SPACE: need {} bytes free on {}, have {}",
-                required,
-                self.dir.display(),
-                free
-            );
-        }
-        Ok(())
-    }
-
-    /// Allocate a new quarantine file path for the given session.
-    ///
-    /// The `original_filename` is sanitized and used only as a cosmetic suffix.
-    /// The UUID prefix is the actual load-bearing component.
-    pub fn allocate_file(&self, original_filename: &str) -> PathBuf {
-        let sanitized = sanitize_filename(original_filename);
-        let uuid = Uuid::new_v4();
-        self.dir.join(format!("{}_{}", uuid, sanitized))
-    }
-
-    /// Delete a quarantine file. Logs errors but does not propagate them
-    /// (we don't want a failed delete to block returning a verdict to the user).
-    pub fn delete_file(&self, path: &PathBuf) {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to delete quarantine file — manual cleanup may be needed"
-            );
-        } else {
-            tracing::debug!("Quarantine file deleted: {}", path.display());
-        }
+    /// The secured directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -222,61 +201,6 @@ fn apply_windows_acl(dir: &Path) -> Result<()> {
         "Quarantine ACL applied — inheritance stripped, single-principal full control"
     );
     Ok(())
-}
-
-/// Query available disk space for the path's filesystem.
-fn available_space(path: &Path) -> Result<u64> {
-    #[cfg(unix)]
-    {
-        use std::mem::MaybeUninit;
-        let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())
-            .context("Quarantine path contains null bytes")?;
-        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-        let ret = unsafe { libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            bail!("statvfs failed on {}: {}", path.display(), err);
-        }
-        let stat = unsafe { stat.assume_init() };
-        // POSIX defines f_bavail in units of f_frsize, NOT f_bsize. Using
-        // f_bsize happens to work where the two are equal and silently
-        // misreports free space where they are not.
-        //
-        // checked_mul, not `*`: this feeds a fail-closed disk guard, and an
-        // overflow here would wrap to a small number and reject valid
-        // downloads, or (worse, on a different code path) wrap high.
-        let frsize = stat.f_frsize as u64;
-        let avail = stat.f_bavail as u64;
-        avail
-            .checked_mul(frsize)
-            .context("Free-space calculation overflowed (f_bavail * f_frsize)")
-    }
-
-    #[cfg(windows)]
-    {
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-        let path_wide: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut free_bytes_available: u64 = 0;
-        let mut total_bytes: u64 = 0;
-        let mut total_free: u64 = 0;
-
-        unsafe {
-            GetDiskFreeSpaceExW(
-                PCWSTR(path_wide.as_ptr()),
-                Some(&mut free_bytes_available),
-                Some(&mut total_bytes),
-                Some(&mut total_free),
-            )
-            .context("GetDiskFreeSpaceExW failed")?;
-        }
-        Ok(free_bytes_available)
-    }
 }
 
 #[cfg(test)]

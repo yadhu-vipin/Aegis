@@ -211,6 +211,174 @@ analysis plus the quarantine broker, not the detonation stage.
 
 ---
 
+## Phase 6 — Archives, Auto-Execution, Authenticode
+
+### Archive inspection (`scanner/archive.rs`)
+
+The largest remaining gap: a ZIP containing `invoice.pdf.exe` scored **zero**.
+The archive is a well-formed ZIP, its entropy is normal for compressed data,
+and `structure.rs` deliberately does not flag executables inside archives. Every
+check looked at the container and none looked at the contents.
+
+**Central directory only, never decompression.** A ZIP records each entry twice
+— a local header before the data and the central directory at the end. The
+central directory is authoritative (it is what extractors read) and gives every
+name, size and flag for the cost of a seek. Three consequences, all deliberate:
+a decompression bomb cannot be triggered by a scanner that never inflates
+anything; the ratio that *identifies* a bomb is in the header already; and
+memory stays proportional to entry count, not payload size.
+
+**Bounds.** 16384 entries walked, 1024-byte names. The declared entry count
+steers the loop but never sizes an allocation — it is attacker-controlled.
+EOCD search window is 65535+22 bytes, which is the complete space the format
+allows (the comment length is 16 bits), not a heuristic.
+
+**Thresholds and why:**
+
+| Signal | Risk | Reasoning |
+|---|---|---|
+| Path traversal (zip-slip) | 0.8 | No archiver produces `../` components. No benign case to trade against. |
+| RLO/bidi character in entry name | 0.85 | Reverses displayed text so `.exe` renders as `.pdf`. Never legitimate in a filename. |
+| Double extension inside | 0.75 | The case the module exists for. |
+| Encrypted entries | 0.5 | Legitimate, but it is the standard way to defeat *all* content scanning — ours and Defender's. |
+| Zip bomb | 0.6 | Requires **both** ≥100:1 ratio **and** ≥1 GB expanded. |
+| Executable entries | 0.15–0.6 | Weak. Archives legitimately contain programs. |
+| Delivery shape (≤3 entries, executable at root) | +0.3, capped 0.7 | A lone runnable file in an otherwise empty archive. |
+| Archive wearing a document extension | 0.7 | Two disguises at once. |
+
+**Zip bomb needs both conditions.** Ratio alone is a false-positive machine — a
+10 KB file of zeros compresses ~1000:1 and is harmless. Absolute size alone
+flags every large legitimate archive. Only enormous expansion *from almost
+nothing* has no benign explanation.
+
+**Executables inside archives stay weak.** This preserves the Phase 3 decision
+rather than reversing it. An installer is an archive containing programs; a
+malware drop is an archive containing *one* program at the root and nothing
+else. The shape carries the signal, not the presence.
+
+### Auto-execution surface (`scanner/autoexec.rs`)
+
+Reframes the question from "does this look malicious?" to **"what happens if
+the user double-clicks it?"** — which is the owner's stated goal and is far
+more answerable.
+
+**Weights reflect how unusual the format is, not how dangerous.** `.exe` is the
+most capable format here and carries one of the lowest weights (0.2), because
+downloading a program is the most ordinary transaction on the internet. `.pif`
+scores 0.65 for the opposite reason: nothing has legitimately produced one in
+decades, and it survives only because Windows still honours it. Getting this
+backwards would flag every software download and miss the formats that matter.
+
+**`.lnk` files are parsed, not just named.** A shortcut carries its command line
+in plain text; reading it costs nothing and says exactly what would run. A
+shortcut invoking a LOLBin scores 0.7, rising to 0.9 with concealment markers
+(`-enc`, `-w hidden`, `DownloadString`). Verified against 41 real shortcuts from
+the user's Recent folder: 40 parsed, none falsely accused.
+
+**Office macros keyed on the format's own promise.** The `x` in `.docx` *means*
+macro-free — Microsoft split the extensions precisely so the name answers the
+question. A `.docx` containing `vbaProject.bin` therefore contradicts itself
+(0.75, Critical), while a `.docm` doing the same is declaring what it is (0.45,
+Medium). Legacy `.doc`/`.xls` are OLE compound files with no such distinction,
+so the `_VBA_PROJECT` stream name is matched as UTF-16LE in the first 1 MB
+(0.5).
+
+**Disc images explain the Mark of the Web.** `.iso`/`.img`/`.vhd` score 0.5 and
+the finding says why: files opened from a mounted image do not inherit the MOTW
+that triggers SmartScreen and Protected View. That bypass is the entire reason
+malware moved to this container, and it is the kind of thing a user cannot be
+expected to know.
+
+### Risk combination: archive and autoexec join by MAX, not sum
+
+Phase 3 established "max within `whole_file_scan`, sum across streaming and
+whole-file", justified by *overlap* — a packed executable trips entropy and PE
+checks for one underlying fact.
+
+Archive and auto-execution analysis do **not** overlap that way; they read the
+ZIP index and the filename rather than the container, so summing would have
+been defensible. They join by max anyway, for a different reason: every check
+that identifies a real attack is already calibrated to be decisive alone
+(0.7–0.85), while the weak ones (an archive contains a program; a document has
+a macro) are weak *precisely because they are common and usually benign*.
+Adding those is how a legitimate installer accumulates its way past the block
+threshold. A false positive on ordinary software costs more than the compound
+case buys.
+
+### Authenticode (`scanner/signature.rs`) — the first NEGATIVE contribution
+
+**This is the only check that can lower a score, and that makes it the only one
+that is an evasion target.** Code-signing certificates are stolen and abused
+routinely. If a signature buys a fixed discount off any detection, then signing
+your malware is a way to purchase a lower risk score — inverting the point of
+the whole scanner.
+
+**The withholding rule** (`apply_trust_credit`, one place, heavily tested):
+
+1. The credit is capped at **0.25** (`MAX_TRUST_CREDIT`).
+2. It is **withheld entirely when any Critical or High finding is present.**
+3. It can never produce a negative score.
+
+Rule 2 is the important one. A signature may settle a genuinely *ambiguous*
+file — the difference between "sandbox this" and "release it" — and nothing
+more. It can never argue away strong evidence. Verified end to end: a genuinely
+Microsoft-signed `kernel32.dll` renamed `invoice.pdf.exe` scores 0.8, undiscounted.
+
+The cost is accepted knowingly: a signed, legitimately-packed installer stays in
+the sandbox band rather than being released. That is the fail-closed direction,
+consistent with the rest of the project.
+
+**Asymmetry in the other direction.** A *broken* signature is strong evidence
+(`TRUST_E_BAD_DIGEST` → 0.8, Critical): someone modified a signed program, which
+has no innocent explanation. Expiry is deliberately mild (0.15) because
+certificates expire and old software keeps working — treating that like
+tampering would be wrong. Unsigned is 0.2, weak, because signing costs money and
+plenty of legitimate software skips it.
+
+**No network, ever.** `WTD_REVOKE_NONE` + `WTD_CACHE_ONLY_URL_RETRIEVAL`.
+Revocation checking fetches CRLs and OCSP responses, which in a download scanner
+means an unbounded stall mid-download and a scanner that behaves differently
+online and offline. **The accepted cost is that a revoked certificate still
+verifies** — and since revocation is how stolen certificates are usually dealt
+with, that is precisely the case we cannot see. Third reason the credit is small.
+
+**Catalog signing was NOT optional.** Verifying embedded signatures only,
+`notepad.exe`, `cmd.exe` and `calc.exe` all reported **Unsigned** — because most
+of Windows is signed by listing hashes in separate signed catalog files, not by
+embedding a signature in each binary. Only `kernel32.dll` of the four had an
+embedded signature. Reporting a signed system binary as unsigned is a
+confidently-incorrect claim, so `CryptCATAdmin*` + `WTD_CHOICE_CATALOG` was
+added, and the catalog's *own* signature is verified — a hash appearing in a
+catalog proves nothing until the catalog itself is checked. All four now verify.
+
+**Known asymmetry between the two signature types.** Modifying an
+*embedded*-signed file yields `Tampered` (0.8). Modifying a *catalog*-signed
+file yields `Unsigned` (0.2), because there is no embedded signature to
+invalidate — the hash simply matches nothing. That is the honest report and a
+genuinely weaker signal. Pinned by a test so it stays a known property rather
+than a surprise.
+
+### Testing against reality, not against our own encoder
+
+Every ZIP fixture in `archive.rs` is built by the test module that consumes it,
+which proves the checks work against *our understanding* of the format. That is
+exactly the class of bug this project keeps hitting. `tests/real_containers.rs`
+therefore hands the scanner archives written by `Compress-Archive` and .NET's
+`ZipFile`, shortcuts written by Explorer, and binaries signed by Microsoft.
+
+**Tests that cannot run must not look like tests that passed.** The first
+version of the Office-document check swallowed read errors with a bare
+`continue` and reported "no documents found" — a clean pass while checking
+nothing. The cause was `os error 362`: every document in `OneDrive\Documents` on
+this machine is a cloud placeholder with no bytes on disk. The test now counts
+"found", "unreadable" and "checked" separately and prints all three.
+
+(Downloads is `C:\Users\yadhu\Downloads`, outside OneDrive, so quarantine is not
+affected by this. If a user ever has OneDrive backing up Downloads, the
+whole-file pass would degrade to streaming-only and say so in the verdict.)
+
+---
+
 ## Phase 3 — Scanner Suite
 
 ### UTF-16 blindness (the biggest single detection gap)

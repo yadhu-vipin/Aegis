@@ -100,15 +100,6 @@ pub fn send_verdict(status: &str, verdict: &str, session_id: Option<&str>) -> Re
     write_message(&obj)
 }
 
-/// Send a chunk acknowledgment back to the Chrome extension.
-pub fn send_chunk_ack(session_id: &str, seq: u64) -> Result<()> {
-    write_message(&serde_json::json!({
-        "type": "CHUNK_ACK",
-        "session_id": session_id,
-        "seq": seq,
-    }))
-}
-
 /// Tell the extension to cancel this download RIGHT NOW.
 ///
 /// Sent mid-transfer when the running risk score crosses the block threshold.

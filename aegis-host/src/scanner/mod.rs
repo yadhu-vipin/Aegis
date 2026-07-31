@@ -15,11 +15,14 @@
 
 #![allow(dead_code)]
 
+pub mod archive;
+pub mod autoexec;
 pub mod entropy;
 pub mod finding;
 pub mod intent;
 pub mod magic_bytes;
 pub mod pe;
+pub mod signature;
 pub mod structure;
 
 use anyhow::Result;
@@ -39,6 +42,10 @@ pub struct ForensicResult {
     pub entropy_anomaly: bool,
     /// PE structure suggests packing or tampering.
     pub pe_anomaly: bool,
+    /// The file is a format that runs something when opened.
+    pub auto_execution: bool,
+    /// What Authenticode says about the file, when it was checkable.
+    pub signature_status: Option<signature::TrustStatus>,
     pub risk_score: f32,
     pub descriptions: Vec<String>,
     /// Structured, explained findings — what the user is actually shown.
@@ -114,7 +121,24 @@ pub async fn deep_forensic_scan(
 /// These checks are impossible on a prefix: locating a format's logical end,
 /// measuring entropy across the file, and walking a PE section table all
 /// require the complete bytes.
+///
+/// Convenience wrapper for callers with only a buffer. Signature verification
+/// needs a real file, so it is skipped and reported as unchecked rather than
+/// silently omitted — see [`whole_file_scan_at`].
 pub fn whole_file_scan(data: &[u8], filename: &str) -> Result<ForensicResult> {
+    whole_file_scan_at(data, filename, None)
+}
+
+/// Whole-file scan for a file that is on disk.
+///
+/// `on_disk` is the quarantine path. Authenticode verification is the one
+/// check that cannot run from a buffer: Windows hashes specific regions of the
+/// PE through a signature provider that takes a path, not a byte range.
+pub fn whole_file_scan_at(
+    data: &[u8],
+    filename: &str,
+    on_disk: Option<&std::path::Path>,
+) -> Result<ForensicResult> {
     let claimed_ext = std::path::Path::new(filename)
         .extension()
         .and_then(|s| s.to_str())
@@ -124,31 +148,68 @@ pub fn whole_file_scan(data: &[u8], filename: &str) -> Result<ForensicResult> {
     let structure_result = structure::analyse(data, filename)?;
     let entropy_result = entropy::analyse(data, &claimed_ext)?;
     let pe_result = pe::analyse(data)?;
+    let archive_result = archive::analyse(data, filename)?;
+    let autoexec_result = autoexec::analyse(data, filename)?;
+    let signature_result = signature::analyse(on_disk, pe_result.is_pe, filename)?;
 
     let mut descriptions = Vec::new();
     descriptions.extend(structure_result.flags.iter().cloned());
     descriptions.extend(entropy_result.flags.iter().cloned());
     descriptions.extend(pe_result.flags.iter().cloned());
+    descriptions.extend(archive_result.flags.iter().cloned());
+    descriptions.extend(autoexec_result.flags.iter().cloned());
+    descriptions.extend(signature_result.flags.iter().cloned());
 
     let mut findings = Vec::new();
     findings.extend(structure_result.findings.iter().cloned());
     findings.extend(entropy_result.findings.iter().cloned());
     findings.extend(pe_result.findings.iter().cloned());
+    findings.extend(archive_result.findings.iter().cloned());
+    findings.extend(autoexec_result.findings.iter().cloned());
+    findings.extend(signature_result.findings.iter().cloned());
 
     // Take the MAXIMUM rather than the sum. These analyses overlap heavily -
     // a packed executable trips entropy AND PE section checks for the same
     // underlying reason - so summing would double-count one fact and push
     // ordinary packed software past the block threshold.
+    //
+    // Archive and auto-execution analysis do NOT overlap with the other three
+    // in the same way - they read the ZIP index and the filename rather than
+    // the container - so summing them would be defensible. They are still
+    // combined by max, for a different reason: each check that identifies a
+    // real attack is already calibrated to be decisive alone (0.7-0.85),
+    // while the weak informational ones (an archive contains a program;
+    // a document has a macro) are weak precisely because they are common and
+    // usually benign. Adding those together is how a legitimate installer
+    // accumulates its way past the block threshold, and a false positive on
+    // ordinary software costs more than the compound case buys.
     let risk_score = structure_result
         .risk
         .max(entropy_result.risk)
         .max(pe_result.risk)
+        .max(archive_result.risk)
+        .max(autoexec_result.risk)
+        .max(signature_result.risk)
         .min(1.0);
 
+    // A valid signature is the one thing that can pull a score DOWN, and the
+    // rule governing when it may do so lives in `signature::apply_trust_credit`
+    // because it is the difference between "a signature settles an ambiguous
+    // file" and "signing your malware buys a discount". Findings must be
+    // sorted first: the rule reads the worst severity present.
+    finding::sort_by_severity(&mut findings);
+    let risk_score = signature::apply_trust_credit(
+        risk_score,
+        signature_result.trust_credit,
+        &findings,
+    );
+
     Ok(ForensicResult {
-        structural_anomaly: structure_result.flagged,
+        structural_anomaly: structure_result.flagged || archive_result.flagged,
         entropy_anomaly: entropy_result.flagged,
         pe_anomaly: pe_result.flagged,
+        auto_execution: autoexec_result.flagged,
+        signature_status: signature_result.status,
         risk_score,
         descriptions,
         findings,
@@ -183,6 +244,8 @@ pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> Foren
         structural_anomaly: whole_file.structural_anomaly,
         entropy_anomaly: whole_file.entropy_anomaly,
         pe_anomaly: whole_file.pe_anomaly,
+        auto_execution: whole_file.auto_execution,
+        signature_status: whole_file.signature_status.clone(),
         risk_score: (streaming.risk_score + whole_file.risk_score).min(1.0),
         descriptions,
         findings,

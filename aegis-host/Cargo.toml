@@ -29,11 +29,13 @@ windows = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
-    # Phase 4 restricted-process sandbox: restricted tokens, Job Objects,
-    # separate window station/desktop, process creation.
-    "Win32_System_Threading",
-    "Win32_System_JobObjects",
-    "Win32_System_StationsAndDesktops",
+    # Authenticode: WinVerifyTrust, plus the crypt32 calls that read the
+    # signer's name out of the embedded PKCS#7 message.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    # Catalog signing: most Windows system binaries carry no embedded
+    # signature, so an embedded-only check calls notepad.exe unsigned.
+    "Win32_Security_Cryptography_Catalog",
 ] }
 
 [target.'cfg(unix)'.dependencies]

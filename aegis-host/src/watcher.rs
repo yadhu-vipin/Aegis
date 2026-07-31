@@ -491,10 +491,6 @@ mod tests {
                 max_download_bytes: 8_589_934_592,
                 max_whole_file_scan_bytes: 67_108_864,
             },
-            sandbox: SandboxConfig {
-                detonation_timeout_secs: 5,
-                max_detonation_size: 262_144_000,
-            },
             quarantine: QuarantineConfig {
                 subdir: "aegis-quarantine".into(),
                 keep_flagged_samples: false,

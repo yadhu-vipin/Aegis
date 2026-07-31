@@ -232,7 +232,12 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
 /// Detect a document-looking extension followed by an executable one.
 ///
 /// Returns `(visible_extension, actual_extension)`.
-fn check_double_extension(filename: &str) -> Option<(String, String)> {
+///
+/// Shared with [`crate::scanner::archive`], which runs the same check on every
+/// entry inside a ZIP. The trick is identical whether the name is on the
+/// download or on something the download unpacks into; only the check's reach
+/// differs.
+pub fn check_double_extension(filename: &str) -> Option<(String, String)> {
     const EXECUTABLE: &[&str] = &[
         "exe", "scr", "com", "bat", "cmd", "pif", "vbs", "vbe", "js", "jse", "wsf", "wsh",
         "msi", "jar", "ps1", "hta", "cpl", "lnk",

@@ -42,15 +42,19 @@ per_chunk_timeout_secs = 30
 # Total transfer timeout in seconds (1 hour)
 total_transfer_timeout_secs = 3600
 
-[sandbox]
-# Detonation timeout in seconds
-detonation_timeout_secs = 30
-# Max file size in bytes for HCS detonation (250 MB)
-# Files larger than this skip live detonation: static-only verdict + warning
-max_detonation_size = 262144000
+# There is no [sandbox] section. Aegis never executes a downloaded file, so
+# there is no detonation timeout to configure and no size limit past which
+# detonation is skipped. This is a design decision, not a missing feature -
+# see DECISIONS.md ("Detonation dropped") for the reasoning.
 
 [quarantine]
-# Quarantine subdirectory name under system temp dir
+# Quarantine subdirectory name.
+#
+# NOT under the system temp dir: this is a subdirectory of the user's Downloads
+# folder, because Chrome's onDeterminingFilename only accepts paths relative to
+# the default download directory. Absolute paths and ".." are rejected by the
+# browser. Aegis creates it, locks it down to the current user, and sweeps
+# abandoned files from it on start-up.
 subdir = "aegis_quarantine"
 # Whether to keep flagged samples on disk after verdict (false = delete)
 keep_flagged_samples = false

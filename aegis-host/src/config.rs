@@ -18,7 +18,6 @@ pub struct Config {
     pub ml: MlConfig,
     pub risk: RiskConfig,
     pub chunking: ChunkingConfig,
-    pub sandbox: SandboxConfig,
     pub quarantine: QuarantineConfig,
 }
 
@@ -74,18 +73,6 @@ impl ChunkingConfig {
     }
     pub fn total_transfer_timeout(&self) -> Duration {
         Duration::from_secs(self.total_transfer_timeout_secs)
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct SandboxConfig {
-    pub detonation_timeout_secs: u64,
-    pub max_detonation_size: u64,
-}
-
-impl SandboxConfig {
-    pub fn detonation_timeout(&self) -> Duration {
-        Duration::from_secs(self.detonation_timeout_secs)
     }
 }
 

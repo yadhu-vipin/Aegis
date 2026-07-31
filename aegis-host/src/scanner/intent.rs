@@ -62,29 +62,77 @@ static WINAPI_RED_FLAGS: &[(&str, f32, &str)] = &[
 ///
 /// `context_prefix` is typically the last N bytes of the previous chunk, so
 /// patterns split across a chunk boundary are not missed.
+/// Extract ASCII text stored as UTF-16LE.
+///
+/// Windows PE files store API names in the import table as ASCII, but almost
+/// every *wide* string — `CreateRemoteThreadW` arguments, registry paths,
+/// embedded commands, .NET metadata — is UTF-16LE. There,
+/// `CreateRemoteThread` is `43 00 72 00 65 00 61 00 ...`, which
+/// `String::from_utf8_lossy` renders as `C<FFFD>r<FFFD>e<FFFD>a...` and never
+/// matches. The red-flag table is overwhelmingly Windows API names, so scanning
+/// only the UTF-8 view left the scanner blind to most of what it hunts for.
+///
+/// `align` handles both byte alignments, since a chunk boundary can land
+/// mid-character.
+///
+/// Non-matching pairs become NUL rather than being skipped: skipping would
+/// splice unrelated fragments together and manufacture matches that are not in
+/// the file. No pattern contains NUL, so it is a safe separator.
+fn utf16le_ascii_view(data: &[u8], align: usize) -> String {
+    if data.len() <= align {
+        return String::new();
+    }
+    data[align..]
+        .chunks_exact(2)
+        .map(|pair| {
+            if pair[1] == 0 && (pair[0].is_ascii_graphic() || pair[0] == b' ') {
+                pair[0] as char
+            } else {
+                '\0'
+            }
+        })
+        .collect()
+}
+
 pub fn detect_dangerous_intent(data: &[u8], context_prefix: Option<&[u8]>) -> Result<IntentResult> {
-    // Build the text we'll search — prefix + current chunk, lossy-decoded
-    // so non-UTF8 bytes become replacement characters (no panic).
-    let text: std::borrow::Cow<str> = if let Some(prefix) = context_prefix {
-        let combined: Vec<u8> = prefix.iter().chain(data.iter()).copied().collect();
-        std::borrow::Cow::Owned(String::from_utf8_lossy(&combined).into_owned())
+    // Prefix + current chunk, so a pattern straddling a chunk boundary is
+    // still found.
+    let owned: Vec<u8>;
+    let bytes: &[u8] = if let Some(prefix) = context_prefix {
+        owned = prefix.iter().chain(data.iter()).copied().collect();
+        &owned
     } else {
-        String::from_utf8_lossy(data)
+        data
     };
+
+    // Scan BOTH encodings. Lossy UTF-8 catches ASCII strings and import names;
+    // the two UTF-16LE alignments catch wide strings.
+    let utf8_view = String::from_utf8_lossy(bytes);
+    let utf16_even = utf16le_ascii_view(bytes, 0);
+    let utf16_odd = utf16le_ascii_view(bytes, 1);
 
     let mut flags: Vec<String> = Vec::new();
     let mut cumulative_risk: f32 = 0.0;
 
     for &(pattern, risk, description) in WINAPI_RED_FLAGS {
-        if text.contains(pattern) {
+        let encoding = if utf8_view.contains(pattern) {
+            Some("utf-8")
+        } else if utf16_even.contains(pattern) || utf16_odd.contains(pattern) {
+            Some("utf-16le")
+        } else {
+            None
+        };
+
+        if let Some(enc) = encoding {
             tracing::warn!(
                 pattern = pattern,
                 risk = risk,
+                encoding = enc,
                 description = description,
                 "Intent flag triggered"
             );
-            flags.push(format!("[risk={:.2}] {}: {}", risk, pattern, description));
-            // Use saturation arithmetic — multiple flags accumulate but cap at 1.0
+            flags.push(format!("[risk={risk:.2}] {pattern} ({enc}): {description}"));
+            // Saturating: multiple flags accumulate but cap at 1.0
             cumulative_risk = (cumulative_risk + risk).min(1.0);
         }
     }
@@ -124,5 +172,77 @@ mod tests {
         let res = detect_dangerous_intent(chunk, Some(prefix)).unwrap();
         assert!(res.flagged);
         assert!(res.risk >= 0.6);
+    }
+
+    /// Encode an ASCII string the way Windows stores wide strings.
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    /// The gap this closes: PE files store wide strings as UTF-16LE, where
+    /// `CreateRemoteThread` lossy-decodes to `C<FFFD>r<FFFD>e...` and never
+    /// matched. Most of the red-flag table is Windows API names, so the
+    /// scanner was blind to the majority of what it targets.
+    #[test]
+    fn detects_winapi_strings_stored_as_utf16le() {
+        let data = utf16le("kernel32.dll CreateRemoteThread ntdll");
+        let res = detect_dangerous_intent(&data, None).unwrap();
+        assert!(
+            res.flagged,
+            "UTF-16LE WinAPI string not detected — the scanner is blind to wide strings"
+        );
+        assert!(res.risk >= 0.6, "risk was {}", res.risk);
+        assert!(
+            res.flags.iter().any(|f| f.contains("utf-16le")),
+            "match should be attributed to utf-16le: {:?}",
+            res.flags
+        );
+    }
+
+    /// A chunk boundary can leave a wide string on an odd byte offset.
+    #[test]
+    fn detects_utf16le_at_odd_alignment() {
+        let mut data = vec![0xFFu8]; // one leading byte shifts alignment
+        data.extend(utf16le("SetWindowsHookEx"));
+        let res = detect_dangerous_intent(&data, None).unwrap();
+        assert!(res.flagged, "odd-aligned UTF-16LE string missed");
+    }
+
+    /// Realistic shape: a PE header followed by wide strings.
+    #[test]
+    fn detects_utf16le_inside_pe_like_blob() {
+        let mut data = b"MZ\x90\x00\x03\x00\x00\x00".to_vec();
+        data.extend(std::iter::repeat_n(0u8, 200));
+        data.extend(utf16le(
+            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        ));
+        let res = detect_dangerous_intent(&data, None).unwrap();
+        assert!(res.flagged, "autorun registry key in UTF-16LE was missed");
+        assert!(res.risk >= 0.7, "risk was {}", res.risk);
+    }
+
+    /// Non-text pairs become NUL rather than being dropped. Dropping would
+    /// splice unrelated fragments together and invent matches: here "Create"
+    /// and "RemoteThread" are separated by binary data and must NOT combine.
+    #[test]
+    fn utf16le_view_does_not_splice_across_gaps() {
+        let mut data = utf16le("Create");
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
+        data.extend(utf16le("RemoteThread"));
+
+        let res = detect_dangerous_intent(&data, None).unwrap();
+        assert!(
+            !res.flags.iter().any(|f| f.contains("CreateRemoteThread")),
+            "fragments separated by binary data were spliced into a false match: {:?}",
+            res.flags
+        );
+    }
+
+    /// Plain binary noise must not trip anything.
+    #[test]
+    fn random_binary_does_not_flag() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let res = detect_dangerous_intent(&data, None).unwrap();
+        assert!(!res.flagged, "binary noise produced flags: {:?}", res.flags);
     }
 }

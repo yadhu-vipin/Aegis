@@ -211,6 +211,89 @@ analysis plus the quarantine broker, not the detonation stage.
 
 ---
 
+## Phase 3 — Scanner Suite
+
+### UTF-16 blindness (the biggest single detection gap)
+
+`intent.rs` scanned only `String::from_utf8_lossy`. Windows PE files store wide
+strings as UTF-16LE, where `CreateRemoteThread` is `43 00 72 00 65 00 ...` and
+lossy-decodes to `C<FFFD>r<FFFD>e...`, matching nothing. Since the red-flag
+table is overwhelmingly Windows API names, the scanner was blind to most of
+what it targets.
+
+Now scans three views: lossy UTF-8, plus UTF-16LE at both byte alignments (a
+chunk boundary can land mid-character). Matches are attributed to the encoding
+that found them.
+
+**Decision:** non-text byte pairs decode to NUL rather than being skipped.
+Skipping would splice unrelated fragments together and manufacture matches not
+present in the file - `Create` + binary gap + `RemoteThread` must not become
+`CreateRemoteThread`. A test asserts exactly that.
+
+### New modules
+
+- **`structure.rs`** - data after a format's logical end (PNG `IEND`, ZIP EOCD
+  with its comment-length field, JPEG `FFD9`, GIF trailer, PDF `%%EOF`),
+  executables embedded inside opaque media, and double extensions
+  (`invoice.pdf.exe`).
+- **`entropy.rs`** - Shannon entropy overall and per 4KB sliding window.
+- **`pe.rs`** - W+X sections, virtual size far exceeding raw size, executable
+  sections empty on disk, entry point outside every section, known packer
+  section names.
+
+### Threshold decisions
+
+**Trailing data ignored below 64 bytes.** Alignment padding is common; a
+payload is not. Below that the false-positive rate would swamp the signal.
+
+**Entropy is interpreted relative to the declared type, never absolutely.**
+7.99 in a ZIP is correct; 7.99 in a `.txt` means it is not text. Compressed
+formats are exempt outright - flagging them would fire on every legitimate
+archive, image and Office document. Used naively, entropy is a false-positive
+machine.
+
+**Executables inside ZIPs are NOT flagged.** Archives legitimately contain
+executables; flagging that fires on every installer. Only executables inside
+*opaque media* (PNG/JPEG/GIF/BMP/RIFF) are suspicious, because those formats
+have no legitimate reason to carry one.
+
+### Risk combination: max within, sum across
+
+`whole_file_scan` takes the **maximum** of structure/entropy/PE, because those
+overlap heavily - a packed executable trips entropy AND PE section checks for
+the same underlying fact, and summing would double-count it and push ordinary
+packed software past the block threshold.
+
+`combine()` **adds** streaming and whole-file scores, because those are genuinely
+independent - "the extension lies about the type" and "a ZIP is appended after
+the image data" are separate findings.
+
+### Memory bound
+
+Structure, entropy and PE analysis need the complete file, so they are the one
+place memory is not flat. `chunking.max_whole_file_scan_bytes` (default 64 MB)
+caps it. Larger files keep their full streaming scan and skip these checks, and
+the verdict says so explicitly rather than implying a clean result.
+
+### Static findings now survive the sandbox stage
+
+Found by testing against the real samples: a file scoring into the sandbox band
+was blocked with only `"Sandbox verdict: SUSPICIOUS. Behaviors: STUB..."` - the
+static findings that sent it there were dropped from the user-facing verdict.
+Since the detonation stub observes nothing, the static analysis is currently the
+*only* part that observed anything, and it was the part being hidden. Verdicts
+on the sandbox and detonation-error paths now carry the static signals too.
+
+### Streaming booleans no longer discarded
+
+`WatchOutcome` now carries `header_valid` / `extension_mismatch` /
+`dangerous_intent` through to `risk::decide()`, replacing the
+`..Default::default()` that silently reset them (open finding 13). They are
+sticky - a signal raised by any span holds for the session, so a later clean
+span cannot clear an earlier detection.
+
+---
+
 ## Phase 2 — Interception Re-Architecture
 
 **Problem:** Chrome exposes no API for a download's byte stream. The old design

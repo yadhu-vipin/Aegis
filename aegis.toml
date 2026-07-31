@@ -27,6 +27,16 @@ ring_buffer_chunks = 4
 # download with no Content-Length can write past whatever the disk-space guard
 # reserved and fill the quarantine volume.
 max_download_bytes = 8589934592
+
+# Largest file the whole-file pass (structure, entropy, PE) will load into
+# memory, in bytes (64 MB default).
+#
+# Those analyses genuinely need the complete file - you cannot find the bytes
+# after a PNG's IEND chunk without them - so they are the one place memory is
+# not flat. Larger files are still fully scanned by the streaming pass; they
+# just skip the whole-file checks, and the verdict says so rather than
+# implying a clean result.
+max_whole_file_scan_bytes = 67108864
 # Per-chunk read timeout in seconds
 per_chunk_timeout_secs = 30
 # Total transfer timeout in seconds (1 hour)

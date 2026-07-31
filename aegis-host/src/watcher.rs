@@ -34,7 +34,7 @@ use crate::scanner;
 const TRAILING_CONTEXT_BYTES: usize = 512;
 
 /// Outcome of watching a download to completion (or to an early kill).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WatchOutcome {
     /// Highest aggregate risk observed across the whole file.
     pub risk_score: f32,
@@ -42,6 +42,12 @@ pub struct WatchOutcome {
     pub descriptions: Vec<String>,
     /// Total bytes scanned.
     pub bytes_scanned: u64,
+    /// Magic bytes identified the file type.
+    pub header_valid: bool,
+    /// Detected type contradicts the claimed extension.
+    pub extension_mismatch: bool,
+    /// Intent scanner flagged something.
+    pub dangerous_intent: bool,
 }
 
 /// Where the download currently lives on disk.
@@ -91,6 +97,10 @@ pub struct DownloadWatcher {
     chunk_scores: Vec<f32>,
     descriptions: Vec<String>,
     is_first_span: bool,
+    // Sticky: once any span raises a signal it stays raised for the session.
+    header_valid: bool,
+    extension_mismatch: bool,
+    dangerous_intent: bool,
 }
 
 impl DownloadWatcher {
@@ -103,6 +113,9 @@ impl DownloadWatcher {
             chunk_scores: Vec::new(),
             descriptions: Vec::new(),
             is_first_span: true,
+            header_valid: false,
+            extension_mismatch: false,
+            dangerous_intent: false,
         }
     }
 
@@ -256,6 +269,11 @@ impl DownloadWatcher {
                     .await?;
 
             self.chunk_scores.push(result.risk_score);
+            // Sticky OR: a signal raised by any span holds for the session.
+            // The first span sets header_valid; later spans must not clear it.
+            self.header_valid |= result.header_valid;
+            self.extension_mismatch |= result.extension_mismatch;
+            self.dangerous_intent |= result.dangerous_intent;
             for d in result.descriptions {
                 if !self.descriptions.contains(&d) {
                     self.descriptions.push(d);
@@ -360,6 +378,9 @@ where
                 risk_score: watcher.current_risk(),
                 descriptions: watcher.descriptions().to_vec(),
                 bytes_scanned: watcher.bytes_scanned(),
+                header_valid: watcher.header_valid,
+                extension_mismatch: watcher.extension_mismatch,
+                dangerous_intent: watcher.dangerous_intent,
             })));
         }
 
@@ -434,6 +455,7 @@ mod tests {
                 per_chunk_timeout_secs: 2,
                 total_transfer_timeout_secs: 10,
                 max_download_bytes: 8_589_934_592,
+                max_whole_file_scan_bytes: 67_108_864,
             },
             sandbox: SandboxConfig {
                 detonation_timeout_secs: 5,

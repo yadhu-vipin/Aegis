@@ -1,32 +1,51 @@
-//! Scanner orchestrator — `deep_forensic_scan()` as specified in the build spec.
+//! Scanner orchestrator.
+//!
+//! Two entry points, because the checks divide naturally by what they need:
+//!
+//! * [`deep_forensic_scan`] runs per-chunk while the download is still
+//!   arriving. Only checks that work on a prefix belong here — magic bytes
+//!   (chunk 0) and intent strings (every chunk, with cross-boundary context).
+//!   This is what makes the early kill possible.
+//!
+//! * [`whole_file_scan`] runs once the download completes. Structure, entropy
+//!   and PE analysis all need the complete file: you cannot find the bytes
+//!   *after* a PNG's `IEND` chunk until you have all of them.
+//!
+//! Both produce a [`ForensicResult`], so `risk::decide()` is unchanged.
 
 #![allow(dead_code)]
 
-pub mod magic_bytes;
+pub mod entropy;
 pub mod intent;
+pub mod magic_bytes;
+pub mod pe;
+pub mod structure;
 
 use anyhow::Result;
-use magic_bytes::MagicBytesResult;
 use intent::IntentResult;
+use magic_bytes::MagicBytesResult;
 
-/// Combined result from a full forensic scan of one chunk.
+/// Combined result from scanning.
 #[derive(Debug, Default, Clone)]
 pub struct ForensicResult {
     pub header_valid: bool,
     pub extension_mismatch: bool,
     pub dangerous_intent: bool,
+    /// Structural anomaly: polyglot, appended payload, double extension.
+    pub structural_anomaly: bool,
+    /// Entropy inconsistent with the declared file type.
+    pub entropy_anomaly: bool,
+    /// PE structure suggests packing or tampering.
+    pub pe_anomaly: bool,
     pub risk_score: f32,
     pub descriptions: Vec<String>,
 }
 
-/// Orchestrate static + intent scanning for one chunk.
+/// Per-chunk scan, called as bytes arrive.
 ///
-/// Called for every chunk as it arrives. Magic-byte scanning only runs on
-/// `is_first_chunk == true` (bytes 0..N of the file). Intent scanning runs
-/// on every chunk with optional cross-boundary context from the ring buffer.
-///
-/// `context_prefix` — last few bytes of the previous chunk, used to catch
-/// patterns that span a chunk boundary. Pass `None` for the first chunk.
+/// Magic-byte scanning only runs on the first chunk. Intent scanning runs on
+/// every chunk with optional trailing context from the previous one, so a
+/// pattern split across a chunk boundary is still matched.
 pub async fn deep_forensic_scan(
     chunk: &[u8],
     filename: &str,
@@ -45,12 +64,8 @@ pub async fn deep_forensic_scan(
     if is_first_chunk && !header_result.description.is_empty() {
         descriptions.push(header_result.description.clone());
     }
-    for flag in &intent_result.flags {
-        descriptions.push(flag.clone());
-    }
+    descriptions.extend(intent_result.flags.iter().cloned());
 
-    // Risk combines magic-byte mismatch and intent signals.
-    // Cap at 1.0 using saturating addition.
     let risk_score = (header_result.risk + intent_result.risk).min(1.0);
 
     Ok(ForensicResult {
@@ -58,6 +73,163 @@ pub async fn deep_forensic_scan(
         extension_mismatch: header_result.mismatch,
         dangerous_intent: intent_result.flagged,
         risk_score,
-        descriptions,
+        ..Default::default()
     })
+    .map(|mut r| {
+        r.descriptions = descriptions;
+        r
+    })
+}
+
+/// Whole-file scan, called once the download has completed.
+///
+/// These checks are impossible on a prefix: locating a format's logical end,
+/// measuring entropy across the file, and walking a PE section table all
+/// require the complete bytes.
+pub fn whole_file_scan(data: &[u8], filename: &str) -> Result<ForensicResult> {
+    let claimed_ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let structure_result = structure::analyse(data, filename)?;
+    let entropy_result = entropy::analyse(data, &claimed_ext)?;
+    let pe_result = pe::analyse(data)?;
+
+    let mut descriptions = Vec::new();
+    descriptions.extend(structure_result.flags.iter().cloned());
+    descriptions.extend(entropy_result.flags.iter().cloned());
+    descriptions.extend(pe_result.flags.iter().cloned());
+
+    // Take the MAXIMUM rather than the sum. These analyses overlap heavily -
+    // a packed executable trips entropy AND PE section checks for the same
+    // underlying reason - so summing would double-count one fact and push
+    // ordinary packed software past the block threshold.
+    let risk_score = structure_result
+        .risk
+        .max(entropy_result.risk)
+        .max(pe_result.risk)
+        .min(1.0);
+
+    Ok(ForensicResult {
+        structural_anomaly: structure_result.flagged,
+        entropy_anomaly: entropy_result.flagged,
+        pe_anomaly: pe_result.flagged,
+        risk_score,
+        descriptions,
+        ..Default::default()
+    })
+}
+
+/// Merge streaming and whole-file results into the verdict input.
+///
+/// Streaming and whole-file findings ARE independent - "the extension lies
+/// about the type" and "there is a ZIP appended after the image data" are
+/// separate facts - so these combine additively, unlike the overlapping
+/// analyses within `whole_file_scan`.
+pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> ForensicResult {
+    let mut descriptions = streaming.descriptions.clone();
+    for d in &whole_file.descriptions {
+        if !descriptions.contains(d) {
+            descriptions.push(d.clone());
+        }
+    }
+
+    ForensicResult {
+        header_valid: streaming.header_valid,
+        extension_mismatch: streaming.extension_mismatch,
+        dangerous_intent: streaming.dangerous_intent,
+        structural_anomaly: whole_file.structural_anomaly,
+        entropy_anomaly: whole_file.entropy_anomaly,
+        pe_anomaly: whole_file.pe_anomaly,
+        risk_score: (streaming.risk_score + whole_file.risk_score).min(1.0),
+        descriptions,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_with(payload: &[u8]) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend(std::iter::repeat_n(0xAAu8, 512));
+        v.extend(b"IEND\xAE\x42\x60\x82");
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn benign_png_scores_zero_across_all_analyses() {
+        let res = whole_file_scan(&png_with(b""), "photo.png").unwrap();
+        assert_eq!(res.risk_score, 0.0, "signals: {:?}", res.descriptions);
+        assert!(!res.structural_anomaly && !res.entropy_anomaly && !res.pe_anomaly);
+    }
+
+    /// The polyglot case: a valid PNG carrying an appended executable.
+    #[test]
+    fn polyglot_png_is_caught_by_the_whole_file_pass() {
+        let mut pe = b"MZ\x90\x00".to_vec();
+        pe.extend(std::iter::repeat_n(0u8, 400));
+        let res = whole_file_scan(&png_with(&pe), "holiday.png").unwrap();
+
+        assert!(res.structural_anomaly, "polyglot missed: {:?}", res.descriptions);
+        assert!(res.risk_score >= 0.7, "risk {}", res.risk_score);
+    }
+
+    /// Overlapping analyses must not double-count. A packed executable trips
+    /// both entropy and PE checks for the same reason; summing them would push
+    /// ordinary packed software over the block threshold.
+    #[test]
+    fn overlapping_signals_do_not_compound_within_whole_file_scan() {
+        let mut data = b"MZ\x90\x00".to_vec();
+        data.extend(std::iter::repeat_n(0u8, 60));
+        let mut state: u64 = 12345;
+        for _ in 0..20000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.push((state >> 24) as u8);
+        }
+        let res = whole_file_scan(&data, "setup.exe").unwrap();
+        assert!(
+            res.risk_score <= 1.0,
+            "risk must stay bounded, got {}",
+            res.risk_score
+        );
+    }
+
+    /// Independent facts SHOULD compound: a type mismatch found while streaming
+    /// plus a structural anomaly found afterwards are two separate problems.
+    #[tokio::test]
+    async fn streaming_and_whole_file_findings_combine() {
+        let mut pe = b"MZ\x90\x00\x03\x00\x00\x00".to_vec();
+        pe.extend(std::iter::repeat_n(0u8, 512));
+
+        let streaming = deep_forensic_scan(&pe, "invoice.pdf", true, None)
+            .await
+            .unwrap();
+        let whole = whole_file_scan(&pe, "invoice.pdf").unwrap();
+        let merged = combine(&streaming, &whole);
+
+        assert!(merged.risk_score >= streaming.risk_score);
+        assert!(merged.risk_score <= 1.0);
+        assert!(merged.extension_mismatch, "type mismatch should survive the merge");
+    }
+
+    #[test]
+    fn whole_file_scan_never_panics_on_hostile_input() {
+        for data in [
+            b"".as_slice(),
+            b"MZ",
+            b"\x89PNG",
+            b"PK\x03\x04",
+            &[0xFFu8; 1000],
+            &[0u8; 1000],
+        ] {
+            let _ = whole_file_scan(data, "x.bin").unwrap();
+            let _ = whole_file_scan(data, "").unwrap();
+        }
+    }
 }

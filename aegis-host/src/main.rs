@@ -404,11 +404,80 @@ async fn handle_watch_session(
         }
 
         watcher::WatchEvent::Completed(outcome) => {
-            let aggregate = ForensicResult {
+            // Streaming findings so far. Carry the booleans through rather
+            // than defaulting them: `decide()` reads only risk_score today,
+            // but silently feeding it `false` for extension_mismatch would be
+            // a trap the moment that changes.
+            let mut aggregate = ForensicResult {
                 risk_score: outcome.risk_score,
+                extension_mismatch: outcome.extension_mismatch,
+                dangerous_intent: outcome.dangerous_intent,
+                header_valid: outcome.header_valid,
+                descriptions: outcome.descriptions.clone(),
                 ..Default::default()
             };
+
+            // Whole-file pass: structure, entropy, PE. These cannot run on a
+            // prefix - locating a format's logical end, measuring entropy over
+            // the file, and walking a PE section table all need every byte.
+            if outcome.bytes_scanned <= cfg.chunking.max_whole_file_scan_bytes {
+                match std::fs::read(&quarantine_path) {
+                    Ok(bytes) => {
+                        match scanner::whole_file_scan(&bytes, &original_filename) {
+                            Ok(whole) => {
+                                if whole.risk_score > 0.0 {
+                                    tracing::info!(
+                                        session = %session_id,
+                                        structural = whole.structural_anomaly,
+                                        entropy = whole.entropy_anomaly,
+                                        pe = whole.pe_anomaly,
+                                        risk = whole.risk_score,
+                                        "Whole-file analysis found anomalies"
+                                    );
+                                }
+                                aggregate = scanner::combine(&aggregate, &whole);
+                            }
+                            // FAIL CLOSED on analysis failure would be too
+                            // aggressive here - the streaming scan already
+                            // succeeded and stands on its own - but the gap
+                            // must be visible in the verdict, not silent.
+                            Err(e) => {
+                                tracing::error!(error = ?e, "whole-file analysis failed");
+                                aggregate.descriptions.push(format!(
+                                    "[warning] whole-file analysis could not run ({e:#}); \
+                                     verdict is based on streaming checks alone"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "could not read quarantined file for analysis");
+                        aggregate.descriptions.push(format!(
+                            "[warning] file could not be re-read for whole-file analysis \
+                             ({e}); verdict is based on streaming checks alone"
+                        ));
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    session = %session_id,
+                    bytes = outcome.bytes_scanned,
+                    limit = cfg.chunking.max_whole_file_scan_bytes,
+                    "File too large for whole-file analysis - streaming scan only"
+                );
+                aggregate.descriptions.push(format!(
+                    "[note] {} bytes exceeds the {} byte whole-file analysis limit; \
+                     polyglot, entropy and PE checks were skipped",
+                    outcome.bytes_scanned, cfg.chunking.max_whole_file_scan_bytes
+                ));
+            }
+
             let decision = risk::decide(&aggregate, &cfg.risk);
+            let outcome = watcher::WatchOutcome {
+                risk_score: aggregate.risk_score,
+                descriptions: aggregate.descriptions.clone(),
+                ..*outcome
+            };
 
             tracing::info!(
                 session = %session_id,
@@ -466,11 +535,23 @@ async fn handle_watch_session(
                                     true
                                 } else {
                                     release::discard(&quarantine_path, "sandbox verdict");
+                                    // Report the STATIC findings alongside the
+                                    // sandbox result. They are what sent the
+                                    // file to the sandbox in the first place,
+                                    // and right now they are the part that
+                                    // actually observed something - the
+                                    // detonation stub observes nothing. A
+                                    // verdict of "Sandbox: SUSPICIOUS (stub)"
+                                    // alone tells the user nothing about why
+                                    // their file was rejected.
                                     native_messaging::send_final_verdict(
                                         &session_id,
                                         "BLOCKED",
                                         &format!(
-                                            "Sandbox verdict: {}. Behaviors: {}",
+                                            "Blocked. Risk {:.2}. Signals: {}. \
+                                             Sandbox verdict: {}. Behaviors: {}",
+                                            outcome.risk_score,
+                                            outcome.descriptions.join("; "),
                                             report.verdict,
                                             report.flagged_behaviors.join("; ")
                                         ),
@@ -487,7 +568,12 @@ async fn handle_watch_session(
                                 native_messaging::send_final_verdict(
                                     &session_id,
                                     "BLOCKED",
-                                    &format!("Not released: sandbox analysis failed ({e:#})"),
+                                    &format!(
+                                        "Not released: risk {:.2} required sandbox analysis, \
+                                         which failed ({e:#}). Signals: {}",
+                                        outcome.risk_score,
+                                        outcome.descriptions.join("; ")
+                                    ),
                                     None,
                                 )?;
                                 false

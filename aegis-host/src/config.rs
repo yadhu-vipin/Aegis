@@ -55,6 +55,17 @@ pub struct ChunkingConfig {
     /// arrive. Without it, a download with no Content-Length can write past
     /// whatever the disk-space guard reserved.
     pub max_download_bytes: u64,
+    /// Largest file the whole-file pass will load into memory.
+    ///
+    /// Structure, entropy and PE analysis need the complete file, so they are
+    /// the one place memory is not flat. Larger files keep their streaming
+    /// scan and skip these checks, and the verdict says so.
+    #[serde(default = "default_max_whole_file_scan_bytes")]
+    pub max_whole_file_scan_bytes: u64,
+}
+
+fn default_max_whole_file_scan_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 impl ChunkingConfig {

@@ -144,6 +144,27 @@ pub fn send_final_verdict(
     verdict: &str,
     released_path: Option<&str>,
 ) -> Result<()> {
+    // Concrete type needed: an empty slice gives the compiler nothing to infer
+    // `T` from.
+    let none: &[Value] = &[];
+    send_final_verdict_with_findings(session_id, status, verdict, released_path, none)
+}
+
+/// Terminal verdict carrying structured findings.
+///
+/// The flat `verdict` string is kept for logging and for anything that cannot
+/// render structure, but `findings` is what the UI should show: each carries a
+/// plain-language title, the technical detail behind it, and why it matters.
+/// A single pre-formatted string forces every surface to show all of it or
+/// none, which is how "Aegis found something suspicious" ended up being the
+/// only thing a user ever saw.
+pub fn send_final_verdict_with_findings<T: serde::Serialize>(
+    session_id: &str,
+    status: &str,
+    verdict: &str,
+    released_path: Option<&str>,
+    findings: &[T],
+) -> Result<()> {
     let mut obj = serde_json::json!({
         "type": "VERDICT",
         "status": status,
@@ -152,6 +173,10 @@ pub fn send_final_verdict(
     });
     if let Some(p) = released_path {
         obj["released_path"] = Value::String(p.to_string());
+    }
+    if !findings.is_empty() {
+        obj["findings"] = serde_json::to_value(findings)
+            .context("Failed to serialize findings for the verdict")?;
     }
     write_message(&obj)
 }

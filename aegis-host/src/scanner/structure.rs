@@ -17,6 +17,7 @@
 //! Runs on the whole file once the download completes, not per-chunk: the
 //! logical end of a format can only be located with the whole thing.
 
+use crate::scanner::finding::{Finding, Severity};
 use anyhow::Result;
 
 /// Result of structural analysis.
@@ -24,6 +25,7 @@ use anyhow::Result;
 pub struct StructureResult {
     pub flagged: bool,
     pub flags: Vec<String>,
+    pub findings: Vec<Finding>,
     pub risk: f32,
     /// Bytes present after the format's logical end, if any.
     pub trailing_bytes: usize,
@@ -114,7 +116,7 @@ fn is_opaque_media(data: &[u8]) -> bool {
 
 /// Analyse a complete file for structural anomalies.
 pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
-    let mut flags = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
     let mut risk: f32 = 0.0;
     let mut trailing_bytes = 0usize;
 
@@ -129,16 +131,26 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
                 let tail = &data[end..];
                 let mut described = false;
 
-                // Name what was appended when we can — far more actionable
-                // than "there is extra data".
                 for (sig, name, sig_risk) in EMBEDDED_SIGNATURES {
                     if tail.len() >= sig.len() && tail.starts_with(sig) {
-                        flags.push(format!(
-                            "[risk={:.2}] {format} file has {name} appended after its logical end \
-                             ({trailing_bytes} bytes) - classic polyglot payload",
-                            sig_risk.max(0.7)
+                        let r = sig_risk.max(0.7);
+                        findings.push(Finding::new(
+                            Severity::High,
+                            format!("Hidden {name} concealed inside an image"),
+                            format!(
+                                "The {format} data ends at byte {end}, but the file continues for \
+                                 another {trailing_bytes} bytes. Those extra bytes begin with a \
+                                 {name} signature."
+                            ),
+                            format!(
+                                "This is a polyglot file: it opens normally as an image, so it \
+                                 looks harmless, while carrying a {name} that other software can \
+                                 extract and run. Legitimate images never have data appended after \
+                                 they end."
+                            ),
+                            r,
                         ));
-                        risk = risk.max(sig_risk.max(0.7));
+                        risk = risk.max(r);
                         described = true;
                         break;
                     }
@@ -146,9 +158,17 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
 
                 if !described {
                     let r = 0.4;
-                    flags.push(format!(
-                        "[risk={r:.2}] {trailing_bytes} bytes present after the {format} \
-                         file's logical end - hidden payload or steganographic container"
+                    findings.push(Finding::new(
+                        Severity::Medium,
+                        "Hidden data appended to the file",
+                        format!(
+                            "The {format} data ends at byte {end}, but the file continues for \
+                             another {trailing_bytes} bytes of unidentified content."
+                        ),
+                        "Data after a file's logical end is invisible to normal viewers but still \
+                         present on disk. It is a common way to smuggle a payload past checks that \
+                         only look at the file's header.",
+                        r,
                     ));
                     risk = risk.max(r);
                 }
@@ -159,7 +179,6 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
     // --- 2. Executables embedded inside opaque media ----------------------
     if is_opaque_media(data) {
         for (sig, name, sig_risk) in EMBEDDED_SIGNATURES {
-            // Skip the file's own header.
             let search_from = std::cmp::min(16, data.len());
             if let Some(pos) = find_subsequence(&data[search_from..], sig) {
                 let abs = pos + search_from;
@@ -169,9 +188,14 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
                         continue;
                     }
                 }
-                flags.push(format!(
-                    "[risk={sig_risk:.2}] {name} signature found at offset {abs} inside an \
-                     image/media file - content does not match the container"
+                findings.push(Finding::new(
+                    Severity::High,
+                    format!("{name} hidden inside image data"),
+                    format!("A {name} signature was found at byte offset {abs}, inside what is otherwise image content."),
+                    "An image file has no legitimate reason to contain a program. This is how \
+                     malware is smuggled through filters that only check the file's extension or \
+                     its first few bytes.",
+                    *sig_risk,
                 ));
                 risk = risk.max(*sig_risk);
             }
@@ -179,23 +203,36 @@ pub fn analyse(data: &[u8], filename: &str) -> Result<StructureResult> {
     }
 
     // --- 3. Double extension -----------------------------------------------
-    // "invoice.pdf.exe" relies on the user reading only the first extension.
-    if let Some(flag) = check_double_extension(filename) {
-        flags.push(flag);
-        risk = risk.max(0.65);
+    if let Some((visible, actual)) = check_double_extension(filename) {
+        let r = 0.65;
+        findings.push(Finding::new(
+            Severity::High,
+            "Filename disguised to look like a document",
+            format!("The name ends in .{actual}, but the .{visible} before it is what draws the eye."),
+            format!(
+                "Windows hides known file extensions by default, so this often displays as a \
+                 harmless .{visible} file. Opening it would actually run a .{actual} program."
+            ),
+            r,
+        ));
+        risk = risk.max(r);
     }
 
     let risk = risk.min(1.0);
+    let flags = findings.iter().map(|f| f.one_line()).collect::<Vec<_>>();
     Ok(StructureResult {
-        flagged: !flags.is_empty(),
+        flagged: !findings.is_empty(),
         flags,
+        findings,
         risk,
         trailing_bytes,
     })
 }
 
 /// Detect a document-looking extension followed by an executable one.
-fn check_double_extension(filename: &str) -> Option<String> {
+///
+/// Returns `(visible_extension, actual_extension)`.
+fn check_double_extension(filename: &str) -> Option<(String, String)> {
     const EXECUTABLE: &[&str] = &[
         "exe", "scr", "com", "bat", "cmd", "pif", "vbs", "vbe", "js", "jse", "wsf", "wsh",
         "msi", "jar", "ps1", "hta", "cpl", "lnk",
@@ -214,10 +251,7 @@ fn check_double_extension(filename: &str) -> Option<String> {
     let second_last = parts[parts.len() - 2].to_lowercase();
 
     if EXECUTABLE.contains(&last.as_str()) && DOCUMENT.contains(&second_last.as_str()) {
-        return Some(format!(
-            "[risk=0.65] Double extension: file appears to be .{second_last} but is actually \
-             .{last} - relies on the user reading only the first extension"
-        ));
+        return Some((second_last, last));
     }
     None
 }
@@ -253,9 +287,11 @@ mod tests {
         assert!(res.risk >= 0.7, "risk too low: {}", res.risk);
         assert!(res.trailing_bytes > 0);
         assert!(
-            res.flags.iter().any(|f| f.contains("ZIP") && f.contains("appended")),
-            "flag should name the appended format: {:?}",
-            res.flags
+            res.findings
+                .iter()
+                .any(|f| f.title.contains("ZIP") && f.title.contains("Hidden")),
+            "finding should name the concealed format: {:?}",
+            res.findings
         );
     }
 

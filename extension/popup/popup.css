@@ -232,6 +232,81 @@ input:checked + .slider:before {
   line-height: 1.4;
 }
 
+/* --- structured findings ---------------------------------------------- */
+
+.finding-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.finding {
+  background-color: #0f172a;
+  border-radius: 4px;
+  padding: 7px 8px;
+  border-left: 3px solid #64748b;
+}
+
+.finding-critical { border-left-color: #dc2626; }
+.finding-high     { border-left-color: #ef4444; }
+.finding-medium   { border-left-color: #f59e0b; }
+.finding-low      { border-left-color: #64748b; }
+
+.finding-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+
+.finding-severity {
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+}
+.finding-critical .finding-severity { color: #f87171; }
+.finding-high     .finding-severity { color: #fca5a5; }
+.finding-medium   .finding-severity { color: #fbbf24; }
+.finding-low      .finding-severity { color: #94a3b8; }
+
+.finding-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #f1f5f9;
+  line-height: 1.3;
+}
+
+/* The sentence that makes the block make sense to a non-specialist. */
+.finding-why {
+  font-size: 11px;
+  color: #cbd5e1;
+  line-height: 1.45;
+}
+
+.finding-evidence { margin-top: 5px; }
+
+.finding-evidence summary {
+  font-size: 10px;
+  color: #64748b;
+  cursor: pointer;
+  outline: none;
+}
+.finding-evidence summary:hover { color: #94a3b8; }
+
+.finding-detail {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10px;
+  color: #94a3b8;
+  margin-top: 4px;
+  padding: 5px;
+  background-color: #1e293b;
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Aegis-broke marker — deliberately distinct from a threat verdict. */
 .verdict-infra-note {
   font-size: 10px;

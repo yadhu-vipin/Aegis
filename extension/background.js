@@ -328,6 +328,24 @@ async function setBadge(text, color) {
  *    Signals: [risk=0.80] nc -e /bin/sh: Netcat reverse shell; ..."
  * The notification gets the human summary; the popup keeps the full detail.
  */
+/**
+ * Prefer the host's structured findings over guessing from a string.
+ *
+ * humanReason() below pattern-matches the flat verdict text, which works only
+ * for phrasings it already knows and falls back to something vague otherwise.
+ * When the host sends findings, it has already said exactly what it found and
+ * why it matters — use that instead of re-deriving it badly.
+ */
+function primaryReason(msg) {
+  const findings = Array.isArray(msg?.findings) ? msg.findings : null;
+  if (findings && findings.length) {
+    // Host sorts worst-first, so [0] is the headline.
+    const f = findings[0];
+    return `${f.title}. ${f.why}`;
+  }
+  return humanReason(msg?.verdict || "");
+}
+
 function humanReason(verdictText = "") {
   const t = verdictText.toLowerCase();
 
@@ -416,8 +434,9 @@ let notificationSeq = 0;
  * Raise a desktop notification. Blocks are loud; releases stay quiet so we
  * don't train the user to dismiss Aegis notifications on reflex.
  */
-function notify({ blocked, filename, verdictText, earlyKill, infrastructure }) {
+function notify({ blocked, filename, verdictText, earlyKill, infrastructure, reasonOverride }) {
   const id = `aegis-${Date.now()}-${notificationSeq++}`;
+  const explanation = reasonOverride || humanReason(verdictText);
 
   let title;
   if (!blocked) {
@@ -436,10 +455,10 @@ function notify({ blocked, filename, verdictText, earlyKill, infrastructure }) {
     message = `${filename} was scanned and saved.`;
   } else if (infrastructure) {
     message =
-      `${filename}\n\n${humanReason(verdictText)}\n\n` +
+      `${filename}\n\n${explanation}\n\n` +
       `The file was not saved. Nothing is wrong with the file — Aegis could not run.`;
   } else {
-    message = `${filename}\n\n${humanReason(verdictText)}\n\nThe file was not saved to your computer.`;
+    message = `${filename}\n\n${explanation}\n\nThe file was not saved to your computer.`;
   }
 
   try {
@@ -718,7 +737,9 @@ function handleVerdict(downloadId, session, msg) {
     url: session.url,
     status: infrastructure ? "AEGIS_ERROR" : msg.status,
     verdict: msg.verdict,
-    reason: humanReason(msg.verdict),
+    reason: infrastructure ? humanReason(msg.verdict) : primaryReason(msg),
+    // Full structured findings, for the popup to render in detail.
+    findings: Array.isArray(msg.findings) ? msg.findings : null,
     infrastructure,
     releasedPath: msg.released_path || null
   });
@@ -729,7 +750,8 @@ function handleVerdict(downloadId, session, msg) {
       blocked: !released,
       infrastructure,
       filename: session.originalFilename,
-      verdictText: msg.verdict
+      verdictText: msg.verdict,
+      reasonOverride: infrastructure ? null : primaryReason(msg)
     });
   }
 

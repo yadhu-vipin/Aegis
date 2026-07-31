@@ -387,7 +387,11 @@ async fn handle_watch_session(
     .await?;
 
     match event {
-        watcher::WatchEvent::EarlyBlock { risk_score, reason } => {
+        watcher::WatchEvent::EarlyBlock {
+            risk_score,
+            reason,
+            findings,
+        } => {
             // Killed mid-flight. Tell the extension first so it cancels the
             // download promptly, then clean up both possible on-disk names.
             native_messaging::send_early_block(&session_id, risk_score, &reason)?;
@@ -395,11 +399,15 @@ async fn handle_watch_session(
             let partial = format!("{}.crdownload", quarantine_path.display());
             release::discard(std::path::Path::new(&partial), "early block (partial)");
 
-            native_messaging::send_final_verdict(
+            // Carry the findings. An early block is the most common outcome -
+            // it is the entire point of scanning while downloading - so this is
+            // usually the only explanation the user ever sees.
+            native_messaging::send_final_verdict_with_findings(
                 &session_id,
                 "BLOCKED",
                 &format!("Blocked during download. {reason}"),
                 None,
+                &findings,
             )?;
         }
 
@@ -490,7 +498,7 @@ async fn handle_watch_session(
             let cleared = match decision {
                 Decision::Block => {
                     release::discard(&quarantine_path, "static verdict: block");
-                    native_messaging::send_final_verdict(
+                    native_messaging::send_final_verdict_with_findings(
                         &session_id,
                         "BLOCKED",
                         &format!(
@@ -499,6 +507,7 @@ async fn handle_watch_session(
                             outcome.descriptions.join("; ")
                         ),
                         None,
+                        &aggregate.findings,
                     )?;
                     false
                 }
@@ -544,7 +553,7 @@ async fn handle_watch_session(
                                     // verdict of "Sandbox: SUSPICIOUS (stub)"
                                     // alone tells the user nothing about why
                                     // their file was rejected.
-                                    native_messaging::send_final_verdict(
+                                    native_messaging::send_final_verdict_with_findings(
                                         &session_id,
                                         "BLOCKED",
                                         &format!(
@@ -556,6 +565,7 @@ async fn handle_watch_session(
                                             report.flagged_behaviors.join("; ")
                                         ),
                                         None,
+                                        &aggregate.findings,
                                     )?;
                                     false
                                 }

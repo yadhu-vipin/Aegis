@@ -27,10 +27,13 @@ use anyhow::Result;
 /// meaningful (256 possible byte values need a reasonable sample).
 pub const WINDOW_SIZE: usize = 4096;
 
+use crate::scanner::finding::{Finding, Severity};
+
 #[derive(Debug, Default, Clone)]
 pub struct EntropyResult {
     pub flagged: bool,
     pub flags: Vec<String>,
+    pub findings: Vec<Finding>,
     pub risk: f32,
     /// Entropy across the whole input.
     pub overall: f32,
@@ -127,17 +130,33 @@ pub fn analyse(data: &[u8], claimed_ext: &str) -> Result<EntropyResult> {
         // A text file has no business being high-entropy.
         if result.overall > 6.5 {
             let r = 0.7;
-            result.flags.push(format!(
-                "[risk={r:.2}] Entropy {:.2} in a .{ext} file that should be plain text \
-                 (text is typically 4.0-5.0) - content is encrypted, compressed or binary",
-                result.overall
+            result.findings.push(Finding::new(
+                Severity::High,
+                "File contents are not readable text",
+                format!(
+                    "Randomness measured at {:.2} bits per byte. Ordinary text measures 4.0-5.0; \
+                     anything above 6.5 is not text at all.",
+                    result.overall
+                ),
+                format!(
+                    "This is named .{ext}, which should be plain readable text, but its contents \
+                     are encrypted, compressed or executable. Something is deliberately \
+                     misrepresenting what this file is."
+                ),
+                r,
             ));
             risk = risk.max(r);
         } else if result.overall > 5.5 {
             let r = 0.35;
-            result.flags.push(format!(
-                "[risk={r:.2}] Entropy {:.2} is high for a .{ext} text file",
-                result.overall
+            result.findings.push(Finding::new(
+                Severity::Medium,
+                "File is less readable than a text file should be",
+                format!(
+                    "Randomness measured at {:.2} bits per byte, above the 4.0-5.0 typical of text.",
+                    result.overall
+                ),
+                format!("A .{ext} file with this much randomness may contain encoded or binary data rather than text."),
+                r,
             ));
             risk = risk.max(r);
         }
@@ -145,31 +164,48 @@ pub fn analyse(data: &[u8], claimed_ext: &str) -> Result<EntropyResult> {
         // Executables and unknown types: high entropy suggests packing.
         if result.overall > 7.2 {
             let r = 0.5;
-            result.flags.push(format!(
-                "[risk={r:.2}] Entropy {:.2} across the whole file - packed, obfuscated \
-                 or encrypted (unpacked executables are typically 5.5-6.5)",
-                result.overall
+            result.findings.push(Finding::new(
+                Severity::Medium,
+                "Program contents are hidden (packed or encrypted)",
+                format!(
+                    "Randomness measured at {:.2} bits per byte across the whole file. An ordinary \
+                     program measures 5.5-6.5; above 7.2 means the contents are compressed or \
+                     encrypted.",
+                    result.overall
+                ),
+                "Packing hides what a program actually does until it runs, which is why malware \
+                 uses it to defeat scanners. Some legitimate software is packed too, so this is a \
+                 warning sign rather than proof.",
+                r,
             ));
             risk = risk.max(r);
         }
 
         // A localised high-entropy region inside otherwise ordinary content is
-        // the shape of an embedded encrypted payload, and is more specific than
-        // a high whole-file average.
+        // the shape of an embedded encrypted payload — more specific than a
+        // high whole-file average.
         if result.max_window > 7.5 && result.overall < 6.5 && data.len() > WINDOW_SIZE * 2 {
             let r = 0.45;
-            result.flags.push(format!(
-                "[risk={r:.2}] Localised high-entropy region (entropy {:.2}) at offset {} \
-                 within otherwise low-entropy content ({:.2}) - embedded encrypted or \
-                 compressed payload",
-                result.max_window, result.max_window_offset, result.overall
+            result.findings.push(Finding::new(
+                Severity::Medium,
+                "Encrypted block hidden inside ordinary content",
+                format!(
+                    "A region at byte offset {} measures {:.2} bits per byte, while the file \
+                     overall measures only {:.2}.",
+                    result.max_window_offset, result.max_window, result.overall
+                ),
+                "A concentrated pocket of encrypted data inside otherwise normal content is the \
+                 shape of a hidden payload — a carrier file with something concealed in it, \
+                 decrypted only when it runs.",
+                r,
             ));
             risk = risk.max(r);
         }
     }
 
     result.risk = risk.min(1.0);
-    result.flagged = !result.flags.is_empty();
+    result.flags = result.findings.iter().map(|f| f.one_line()).collect();
+    result.flagged = !result.findings.is_empty();
     Ok(result)
 }
 

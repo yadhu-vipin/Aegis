@@ -18,6 +18,7 @@
 //! `Ok(not a PE)` rather than an error or a panic. Refusing to parse is a
 //! perfectly good outcome; crashing is not.
 
+use crate::scanner::finding::{Finding, Severity};
 use anyhow::Result;
 
 #[derive(Debug, Default, Clone)]
@@ -25,6 +26,7 @@ pub struct PeResult {
     pub is_pe: bool,
     pub flagged: bool,
     pub flags: Vec<String>,
+    pub findings: Vec<Finding>,
     pub risk: f32,
     pub section_count: usize,
 }
@@ -101,10 +103,15 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
     // A real PE has a handful of sections. An absurd count is either corruption
     // or a deliberate attempt to make a parser allocate.
     if num_sections == 0 || num_sections > 96 {
-        result.flags.push(format!(
-            "[risk=0.55] PE declares {num_sections} sections - implausible, header is \
-             corrupt or deliberately malformed"
+        result.findings.push(Finding::new(
+            Severity::High,
+            "Program file is malformed",
+            format!("The program header declares {num_sections} sections. Real programs have a handful."),
+            "A header this broken is either corrupt or deliberately malformed to confuse security \
+             scanners into misreading the file or crashing.",
+            0.55,
         ));
+        result.flags = result.findings.iter().map(|f| f.one_line()).collect();
         result.risk = result.risk.max(0.55);
         result.flagged = true;
         return Ok(result);
@@ -119,7 +126,7 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
     // --- Section table ----------------------------------------------------
     let sec_table = opt_header + opt_header_size;
     let mut risk: f32 = 0.0;
-    let mut flags: Vec<String> = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
 
     let mut entry_in_section = false;
     let mut unknown_names: Vec<String> = Vec::new();
@@ -127,10 +134,13 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
     for i in 0..num_sections {
         let off = sec_table + i * 40;
         if off + 40 > data.len() {
-            flags.push(
-                "[risk=0.5] Section table extends past end of file - truncated or malformed"
-                    .to_string(),
-            );
+            findings.push(Finding::new(
+                Severity::Medium,
+                "Program file is truncated or malformed",
+                "The section table claims to extend past the end of the file.".to_string(),
+                "The file does not match its own description of itself - it is either damaged or                  crafted to confuse tools that parse it.",
+                0.5,
+            ));
             risk = risk.max(0.5);
             break;
         }
@@ -160,9 +170,14 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
         let wx = (characteristics & IMAGE_SCN_MEM_WRITE) != 0
             && (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
         if wx {
-            flags.push(format!(
-                "[risk=0.7] Section '{name}' is both writable and executable - \
-                 self-modifying code, characteristic of packers and shellcode loaders"
+            findings.push(Finding::new(
+                Severity::High,
+                "Program can rewrite its own code while running",
+                format!("Section '{name}' is marked both writable and executable."),
+                "Compilers never produce this. It means the program modifies its own instructions \
+                 as it runs, which is how packed malware unpacks its real payload in memory, where \
+                 a file scanner cannot see it.",
+                0.7,
             ));
             risk = risk.max(0.7);
         }
@@ -170,10 +185,17 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
         // Virtual size far exceeding raw size means the section is filled at
         // runtime — the unpacking stub writing the real payload into memory.
         if raw_size > 0 && virtual_size > raw_size.saturating_mul(4) && virtual_size > 0x1000 {
-            flags.push(format!(
-                "[risk=0.55] Section '{name}' occupies {virtual_size} bytes in memory but \
-                 only {raw_size} on disk - the difference is written at runtime, typical \
-                 of a packed executable"
+            findings.push(Finding::new(
+                Severity::High,
+                "Program expands itself in memory when run",
+                format!(
+                    "Section '{name}' occupies {virtual_size} bytes in memory but only \
+                     {raw_size} on disk."
+                ),
+                "The missing content is generated while the program runs. This is how packers \
+                 work: the real code only exists once it has started, so nothing on disk reveals \
+                 what it actually does.",
+                0.55,
             ));
             risk = risk.max(0.55);
         }
@@ -181,9 +203,14 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
         // An executable section with no on-disk content has to be populated by
         // something else before it can run.
         if raw_size == 0 && (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 && virtual_size > 0 {
-            flags.push(format!(
-                "[risk=0.6] Section '{name}' is executable but empty on disk - its code \
-                 must be written at runtime"
+            findings.push(Finding::new(
+                Severity::High,
+                "Program contains code that does not exist on disk",
+                format!("Section '{name}' is marked executable but contains no data in the file."),
+                "Code must be written into this space before it can run, meaning the program \
+                 assembles its real instructions at runtime rather than shipping them where they \
+                 could be inspected.",
+                0.6,
             ));
             risk = risk.max(0.6);
         }
@@ -193,9 +220,14 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
             .iter()
             .find(|(sec, _)| sec.eq_ignore_ascii_case(&name))
         {
-            flags.push(format!(
-                "[risk=0.6] Section '{name}' identifies the {packer} packer - the real \
-                 payload is compressed and only visible once unpacked in memory"
+            findings.push(Finding::new(
+                Severity::High,
+                format!("Program is compressed with {packer}"),
+                format!("Section name '{name}' is the signature of the {packer} packer."),
+                "Packing compresses a program so its contents cannot be examined until it runs. \
+                 Legitimate software occasionally does this to save space; malware does it to \
+                 hide what it will do.",
+                0.6,
             ));
             risk = risk.max(0.6);
         } else if !name.is_empty() && !KNOWN_SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(&name))
@@ -205,9 +237,16 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
     }
 
     if !entry_in_section && entry_point != 0 {
-        flags.push(format!(
-            "[risk=0.65] Entry point 0x{entry_point:X} falls outside every declared section \
-             - the start address has been redirected"
+        findings.push(Finding::new(
+            Severity::High,
+            "Program starts from an address it never declared",
+            format!(
+                "The entry point 0x{entry_point:X} falls outside every section the file declares."
+            ),
+            "The program begins executing somewhere it told the system nothing about. This is what \
+             happens when a file has been tampered with to inject code, or when it is hiding where \
+             execution really begins.",
+            0.65,
         ));
         risk = risk.max(0.65);
     }
@@ -215,18 +254,25 @@ pub fn analyse(data: &[u8]) -> Result<PeResult> {
     // Individually weak; several together is a real signal.
     if unknown_names.len() >= 2 {
         let r = 0.3;
-        flags.push(format!(
-            "[risk={r:.2}] {} non-standard section names ({}) - no mainstream compiler \
-             emits these",
-            unknown_names.len(),
-            unknown_names.join(", ")
+        findings.push(Finding::new(
+            Severity::Low,
+            "Program was not built by a standard compiler",
+            format!(
+                "{} unrecognised section names: {}",
+                unknown_names.len(),
+                unknown_names.join(", ")
+            ),
+            "Mainstream compilers emit a well-known set of section names. Unusual ones suggest \
+             the file was assembled by a packer or a custom tool rather than built normally.",
+            r,
         ));
         risk = risk.max(r);
     }
 
-    result.flags = flags;
+    result.flags = findings.iter().map(|f| f.one_line()).collect();
+    result.findings = findings;
     result.risk = risk.min(1.0);
-    result.flagged = !result.flags.is_empty();
+    result.flagged = !result.findings.is_empty();
     Ok(result)
 }
 
@@ -301,7 +347,11 @@ mod tests {
         let res = analyse(&pe).unwrap();
         assert!(res.flagged);
         assert!(res.risk >= 0.7, "risk was {}", res.risk);
-        assert!(res.flags.iter().any(|f| f.contains("writable and executable")));
+        assert!(
+            res.findings.iter().any(|f| f.title.contains("rewrite its own code")),
+            "{:?}",
+            res.findings
+        );
     }
 
     /// Virtual size >> raw size means the section is filled at runtime.
@@ -310,7 +360,11 @@ mod tests {
         let pe = build_pe(&[(".text", 0x10000, 0x1000, 0x400, R_X)], 0x1500);
         let res = analyse(&pe).unwrap();
         assert!(res.flagged);
-        assert!(res.flags.iter().any(|f| f.contains("written at runtime")));
+        assert!(
+            res.findings.iter().any(|f| f.why.contains("packers work")),
+            "{:?}",
+            res.findings
+        );
     }
 
     #[test]
@@ -337,9 +391,11 @@ mod tests {
         let res = analyse(&pe).unwrap();
         assert!(res.flagged);
         assert!(
-            res.flags.iter().any(|f| f.contains("outside every declared section")),
+            res.findings
+                .iter()
+                .any(|f| f.title.contains("never declared")),
             "{:?}",
-            res.flags
+            res.findings
         );
     }
 
@@ -372,6 +428,10 @@ mod tests {
         d[0x80 + 6..0x80 + 8].copy_from_slice(&0xFFFFu16.to_le_bytes());
         let res = analyse(&d).unwrap();
         assert!(res.flagged);
-        assert!(res.flags.iter().any(|f| f.contains("implausible")));
+        assert!(
+            res.findings.iter().any(|f| f.title.contains("malformed")),
+            "{:?}",
+            res.findings
+        );
     }
 }

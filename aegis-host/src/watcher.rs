@@ -96,6 +96,7 @@ pub struct DownloadWatcher {
     trailing: Vec<u8>,
     chunk_scores: Vec<f32>,
     descriptions: Vec<String>,
+    findings: Vec<crate::scanner::finding::Finding>,
     is_first_span: bool,
     // Sticky: once any span raises a signal it stays raised for the session.
     header_valid: bool,
@@ -112,6 +113,7 @@ impl DownloadWatcher {
             trailing: Vec::new(),
             chunk_scores: Vec::new(),
             descriptions: Vec::new(),
+            findings: Vec::new(),
             is_first_span: true,
             header_valid: false,
             extension_mismatch: false,
@@ -130,6 +132,13 @@ impl DownloadWatcher {
 
     pub fn descriptions(&self) -> &[String] {
         &self.descriptions
+    }
+
+    /// Explained findings gathered so far, worst first.
+    pub fn findings(&self) -> Vec<crate::scanner::finding::Finding> {
+        let mut f = self.findings.clone();
+        crate::scanner::finding::sort_by_severity(&mut f);
+        f
     }
 }
 
@@ -279,6 +288,19 @@ impl DownloadWatcher {
                     self.descriptions.push(d);
                 }
             }
+            // Explained findings, deduplicated by title+detail. Without these
+            // an early block - the most common outcome, since it is the whole
+            // point of scanning while downloading - reached the user with no
+            // explanation at all.
+            for f in result.findings {
+                if !self
+                    .findings
+                    .iter()
+                    .any(|e| e.title == f.title && e.detail == f.detail)
+                {
+                    self.findings.push(f);
+                }
+            }
 
             // Retain only a bounded tail — this is what keeps memory flat.
             let keep = std::cmp::min(TRAILING_CONTEXT_BYTES, span.len());
@@ -297,7 +319,13 @@ impl DownloadWatcher {
 /// Signals the caller can act on while a download is in flight.
 pub enum WatchEvent {
     /// Risk crossed the block threshold — cancel the download now.
-    EarlyBlock { risk_score: f32, reason: String },
+    EarlyBlock {
+        risk_score: f32,
+        reason: String,
+        /// Explained findings, worst first. An early block is the most common
+        /// outcome, so this is usually the only explanation the user ever sees.
+        findings: Vec<crate::scanner::finding::Finding>,
+    },
     /// Download finished and was scanned to the end.
     Completed(Box<WatchOutcome>),
 }
@@ -329,6 +357,7 @@ where
                 return Ok(WatchEvent::EarlyBlock {
                     risk_score: 1.0,
                     reason: format!("Blocked by another security product: {detail}"),
+                    findings: watcher.findings(),
                 });
             }
         };
@@ -346,6 +375,7 @@ where
                         watcher.bytes_scanned(),
                         cfg.chunking.max_download_bytes
                     ),
+                    findings: watcher.findings(),
                 });
             }
 
@@ -361,6 +391,7 @@ where
                         watcher.bytes_scanned(),
                         watcher.descriptions().join("; ")
                     ),
+                    findings: watcher.findings(),
                 });
             }
         }
@@ -372,6 +403,7 @@ where
                 return Ok(WatchEvent::EarlyBlock {
                     risk_score: 1.0,
                     reason: format!("Blocked by another security product: {detail}"),
+                    findings: watcher.findings(),
                 });
             }
             return Ok(WatchEvent::Completed(Box::new(WatchOutcome {
@@ -393,6 +425,7 @@ where
                     "Download stalled: no new bytes for {}s",
                     per_chunk_timeout.as_secs()
                 ),
+                findings: watcher.findings(),
             });
         }
         if started.elapsed() > total_timeout {
@@ -402,6 +435,7 @@ where
                     "Download exceeded total transfer timeout of {}s",
                     total_timeout.as_secs()
                 ),
+                findings: watcher.findings(),
             });
         }
 
@@ -494,7 +528,7 @@ mod tests {
         let event = watch_download(&mut w, &cfg, |_, _| {}).await.unwrap();
 
         match event {
-            WatchEvent::EarlyBlock { risk_score, reason } => {
+            WatchEvent::EarlyBlock { risk_score, reason, .. } => {
                 assert!(
                     risk_score >= cfg.risk.block_threshold,
                     "early block fired at {risk_score}, below threshold"

@@ -16,12 +16,14 @@
 #![allow(dead_code)]
 
 pub mod entropy;
+pub mod finding;
 pub mod intent;
 pub mod magic_bytes;
 pub mod pe;
 pub mod structure;
 
 use anyhow::Result;
+use finding::{severity_for, Finding, Severity};
 use intent::IntentResult;
 use magic_bytes::MagicBytesResult;
 
@@ -39,6 +41,8 @@ pub struct ForensicResult {
     pub pe_anomaly: bool,
     pub risk_score: f32,
     pub descriptions: Vec<String>,
+    /// Structured, explained findings — what the user is actually shown.
+    pub findings: Vec<Finding>,
 }
 
 /// Per-chunk scan, called as bytes arrive.
@@ -61,10 +65,36 @@ pub async fn deep_forensic_scan(
     let intent_result: IntentResult = intent::detect_dangerous_intent(chunk, context_prefix)?;
 
     let mut descriptions = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
+
     if is_first_chunk && !header_result.description.is_empty() {
         descriptions.push(header_result.description.clone());
+
+        if header_result.mismatch {
+            findings.push(Finding::new(
+                Severity::Critical,
+                "File is not the type it claims to be",
+                header_result.description.clone(),
+                "The file's actual contents contradict its extension. A program renamed to look \
+                 like a document or image is the oldest trick there is, and the reason it still \
+                 works is that people trust the name.",
+                header_result.risk,
+            ));
+        }
     }
-    descriptions.extend(intent_result.flags.iter().cloned());
+
+    for flag in &intent_result.flags {
+        descriptions.push(flag.clone());
+        findings.push(Finding::new(
+            severity_for(intent_result.risk),
+            "File contains code associated with malware",
+            flag.clone(),
+            "Programs that inject into other processes, log keystrokes, install themselves to run \
+             at startup, or open remote shells are doing things ordinary software has no reason \
+             to do.",
+            intent_result.risk,
+        ));
+    }
 
     let risk_score = (header_result.risk + intent_result.risk).min(1.0);
 
@@ -73,11 +103,9 @@ pub async fn deep_forensic_scan(
         extension_mismatch: header_result.mismatch,
         dangerous_intent: intent_result.flagged,
         risk_score,
+        descriptions,
+        findings,
         ..Default::default()
-    })
-    .map(|mut r| {
-        r.descriptions = descriptions;
-        r
     })
 }
 
@@ -102,6 +130,11 @@ pub fn whole_file_scan(data: &[u8], filename: &str) -> Result<ForensicResult> {
     descriptions.extend(entropy_result.flags.iter().cloned());
     descriptions.extend(pe_result.flags.iter().cloned());
 
+    let mut findings = Vec::new();
+    findings.extend(structure_result.findings.iter().cloned());
+    findings.extend(entropy_result.findings.iter().cloned());
+    findings.extend(pe_result.findings.iter().cloned());
+
     // Take the MAXIMUM rather than the sum. These analyses overlap heavily -
     // a packed executable trips entropy AND PE section checks for the same
     // underlying reason - so summing would double-count one fact and push
@@ -118,6 +151,7 @@ pub fn whole_file_scan(data: &[u8], filename: &str) -> Result<ForensicResult> {
         pe_anomaly: pe_result.flagged,
         risk_score,
         descriptions,
+        findings,
         ..Default::default()
     })
 }
@@ -136,6 +170,12 @@ pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> Foren
         }
     }
 
+    let mut findings = streaming.findings.clone();
+    findings.extend(whole_file.findings.iter().cloned());
+    // Worst first: a notification has room for one line and it must be the one
+    // that matters, not whichever check happened to run first.
+    finding::sort_by_severity(&mut findings);
+
     ForensicResult {
         header_valid: streaming.header_valid,
         extension_mismatch: streaming.extension_mismatch,
@@ -145,6 +185,7 @@ pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> Foren
         pe_anomaly: whole_file.pe_anomaly,
         risk_score: (streaming.risk_score + whole_file.risk_score).min(1.0),
         descriptions,
+        findings,
     }
 }
 

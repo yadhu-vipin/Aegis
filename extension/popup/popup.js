@@ -77,6 +77,57 @@ function renderVerdict(item) {
     row.appendChild(note);
   }
 
+  // Structured findings: what was found, and why it matters. This is the
+  // actual explanation - the flat verdict string below is only a fallback for
+  // entries recorded before the host sent findings.
+  if (Array.isArray(item.findings) && item.findings.length) {
+    const list = document.createElement("div");
+    list.className = "finding-list";
+
+    item.findings.forEach((f) => {
+      const card = document.createElement("div");
+      card.className = `finding finding-${(f.severity || "low").toLowerCase()}`;
+
+      const head = document.createElement("div");
+      head.className = "finding-head";
+
+      const sev = document.createElement("span");
+      sev.className = "finding-severity";
+      sev.textContent = (f.severity || "low").toUpperCase();
+
+      const title = document.createElement("span");
+      title.className = "finding-title";
+      title.textContent = f.title || "";
+
+      head.append(sev, title);
+
+      // Why it matters, in terms of consequences - the part that makes the
+      // block make sense to someone who is not a security engineer.
+      const why = document.createElement("div");
+      why.className = "finding-why";
+      why.textContent = f.why || "";
+
+      card.append(head, why);
+
+      // The evidence, for anyone who wants to check the reasoning.
+      if (f.detail) {
+        const det = document.createElement("details");
+        det.className = "finding-evidence";
+        const sum = document.createElement("summary");
+        sum.textContent = "What was found";
+        const body = document.createElement("div");
+        body.className = "finding-detail";
+        body.textContent = f.detail;
+        det.append(sum, body);
+        card.appendChild(det);
+      }
+
+      list.appendChild(card);
+    });
+
+    row.appendChild(list);
+  }
+
   // Full technical detail, collapsed. Useful when explaining a decision;
   // noise the rest of the time.
   if (item.verdict && item.verdict !== item.reason) {

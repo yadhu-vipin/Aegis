@@ -589,19 +589,35 @@ async fn handle_watch_session(msg: &Value, cfg: &config::Config) -> Result<()> {
             if cleared {
                 match release::release(&quarantine_path, &downloads, &original_filename) {
                     Ok(released) => {
-                        native_messaging::send_final_verdict(
+                        // Carry the findings on the RELEASE path too, not just
+                        // on blocks.
+                        //
+                        // A cleared file still has things worth saying about
+                        // it: "Signed by Microsoft Corporation" is the entire
+                        // user-visible payoff of Authenticode verification, and
+                        // it only ever appears here — a signed file passes, so
+                        // it never reaches a block path. Sending an empty
+                        // findings list meant the one check that can produce
+                        // good news could never deliver any.
+                        //
+                        // It also makes the low-severity notes visible: "this
+                        // archive contains a program" is worth knowing before
+                        // opening it, even though it is not worth blocking.
+                        native_messaging::send_final_verdict_with_findings(
                             &session_id,
                             "COMPLETE",
                             &format!(
-                                "Released to Downloads. Risk {:.2}{}",
+                                "Released to Downloads. Risk {:.2}.{}{}",
                                 outcome.risk_score,
+                                provenance_summary(&aggregate.signature_status),
                                 if released.renamed {
-                                    " (renamed to avoid overwriting an existing file)"
+                                    " Renamed to avoid overwriting an existing file."
                                 } else {
                                     ""
                                 }
                             ),
                             Some(&released.final_path.to_string_lossy()),
+                            &aggregate.findings,
                         )?;
                     }
                     Err(e) => {
@@ -623,6 +639,35 @@ async fn handle_watch_session(msg: &Value, cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
+
+/// One clause naming who signed a released file, if anyone.
+///
+/// Provenance is the only *positive* thing Aegis can report, and it belongs in
+/// the released-file message where the user is deciding whether to open
+/// something. Silence is deliberate for the unsignable majority: saying "this
+/// PNG is unsigned" would be noise, because images are never signed and the
+/// observation carries no information.
+fn provenance_summary(status: &Option<scanner::signature::TrustStatus>) -> String {
+    use scanner::signature::TrustStatus;
+    match status {
+        Some(TrustStatus::Trusted { publisher }) => match publisher {
+            Some(p) => format!(" Signed by {p}."),
+            None => " Carries a valid signature.".to_string(),
+        },
+        Some(TrustStatus::TrustedByCatalog { .. }) => {
+            " Verified against a signed Windows catalogue.".to_string()
+        }
+        // An unsigned executable is worth mentioning on release precisely
+        // because it passed: the user is about to run something whose origin
+        // nobody can vouch for, and that is a fact about the file rather than
+        // an accusation against it.
+        Some(TrustStatus::Unsigned) => " Not digitally signed — its origin cannot be verified.".to_string(),
+        Some(TrustStatus::Unavailable(_)) | None => String::new(),
+        // The remaining states carry real risk, so they raise the score and
+        // appear as findings. Restating them here would double-report.
+        Some(_) => String::new(),
+    }
+}
 
 /// Handle a CHECK_URL message.
 ///

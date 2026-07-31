@@ -253,6 +253,20 @@ input:checked + .slider:before {
 .finding-medium   { border-left-color: #f59e0b; }
 .finding-low      { border-left-color: #64748b; }
 
+/* Header above the findings list. Wording and colour both change depending on
+   whether the file was delivered: on a cleared download these are notes (often
+   including who signed it), not reasons for a refusal. */
+.finding-heading {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #94a3b8;
+  margin-bottom: 2px;
+}
+
+.finding-heading.cleared { color: #6ee7b7; }
+
 .finding-head {
   display: flex;
   align-items: baseline;

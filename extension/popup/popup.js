@@ -84,6 +84,21 @@ function renderVerdict(item) {
     const list = document.createElement("div");
     list.className = "finding-list";
 
+    // Findings on a file that was RELEASED are notes, not accusations.
+    //
+    // They arrive on the release path so provenance can be shown at all -
+    // "Signed by Microsoft Corporation" only ever appears on a file that
+    // passed, because a signed file does not get blocked. Rendering those
+    // identically to the reasons for a block would make every cleared download
+    // look like a near miss, which is both untrue and exhausting.
+    const cleared = item.status === "COMPLETE";
+    const heading = document.createElement("div");
+    heading.className = cleared ? "finding-heading cleared" : "finding-heading";
+    heading.textContent = cleared
+      ? "Notes on this file"
+      : "Why this was not delivered";
+    list.appendChild(heading);
+
     item.findings.forEach((f) => {
       const card = document.createElement("div");
       card.className = `finding finding-${(f.severity || "low").toLowerCase()}`;

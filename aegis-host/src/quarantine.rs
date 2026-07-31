@@ -76,15 +76,56 @@ impl Quarantine {
     }
 }
 
-/// Sanitize a browser-supplied filename to prevent path traversal.
+/// Characters that must not survive into a filename, and why each one.
 ///
-/// Rules applied per spec §4:
-/// - Strip path separators (`/`, `\`)
-/// - Remove `..` components
-/// - Strip null bytes
-/// - Reject Windows reserved device names (case-insensitive), replacing with `_reserved_`
-/// - Limit length to 128 characters
-/// - Replace any remaining non-safe chars with `_`
+/// Kept as one predicate rather than an if/else chain because every branch has
+/// the same consequence — the character is replaced — and the reasons belong in
+/// prose, not in control flow.
+fn is_unsafe_in_filename(c: char) -> bool {
+    // Forbidden by Windows. `:` matters most: `notes.txt:payload.exe` names an
+    // NTFS alternate data stream, which is a place to hide a payload rather
+    // than a filename.
+    const WINDOWS_FORBIDDEN: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+    // Bidirectional overrides. `invoice\u{202E}fdp.exe` displays as
+    // `invoiceexe.pdf`, so the name a user reads is not the name Windows runs.
+    // `archive::analyse` reports these inside a ZIP as Critical; without this,
+    // the identical trick would pass through into a released filename where
+    // nothing else looks for it.
+    const BIDI: fn(char) -> bool = |c| {
+        matches!(
+            c,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+        )
+    };
+
+    // Control characters are invisible, and a newline corrupts every log line
+    // that reports the name.
+    WINDOWS_FORBIDDEN.contains(&c) || c.is_control() || BIDI(c)
+}
+
+/// Make a browser-supplied filename safe to use, without making it unreadable.
+///
+/// This name crosses the extension trust boundary and then becomes a real file
+/// in the user's Downloads folder, so it is attacker-influenced input. But it
+/// is also the name a person will look at, and the two goals only appear to
+/// conflict — safety needs specific characters gone, not a narrow allowlist.
+///
+/// Removed, and why:
+/// - path separators (`/`, `\`) and `..` — directory traversal
+/// - null bytes and control characters — invisible, and a newline corrupts
+///   every log line reporting the name
+/// - `< > : " | ? *` — forbidden by Windows; `:` in particular would open an
+///   NTFS alternate data stream (`notes.txt:payload.exe`)
+/// - bidirectional overrides (U+202A–U+202E, U+2066–U+2069, U+200E/U+200F) —
+///   these reverse how the rest of the name displays, so the name shown is not
+///   the name executed
+/// - trailing dots and spaces — Windows strips them silently, so `evil.exe.`
+///   would open as `evil.exe`
+/// - Windows reserved device names (`CON`, `NUL`, `COM1`…) — replaced whole
+///
+/// Kept: everything else, including non-ASCII. Length is capped at 128
+/// characters, counted so truncation cannot split a multi-byte character.
 pub fn sanitize_filename(filename: &str) -> String {
     // Take the basename FIRST, while separators are still present — stripping
     // them first (as this previously did) made the rsplit calls dead code.
@@ -117,19 +158,31 @@ pub fn sanitize_filename(filename: &str) -> String {
         &basename
     };
 
-    // Replace remaining chars that are not safe ASCII
+    // Replace only what is genuinely unsafe, and keep everything else.
+    //
+    // This used to be an ASCII allowlist: anything outside `[A-Za-z0-9._-]`
+    // became `_`. That is safe, and it also renamed `Résumé.pdf` to
+    // `R_sum_.pdf`, `report (final).pdf` to `report__final_.pdf`, and any
+    // filename not written in English to a row of underscores. Aegis is
+    // supposed to be invisible when a file is fine; handing back a mangled
+    // name is the opposite, and it fell hardest on users whose language is
+    // not the one the allowlist was written for.
+    //
+    // Safety does not require an ASCII allowlist. It requires that the result
+    // cannot traverse directories, cannot name a device, and cannot lie about
+    // what it is. Each of those is handled explicitly:
     let safe: String = basename
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if is_unsafe_in_filename(c) { '_' } else { c })
         .collect();
 
-    // Limit length
+    // Windows silently strips trailing dots and spaces, so `evil.exe.` opens
+    // as `evil.exe`. Removing them here means the name Aegis reports is the
+    // name the filesystem will actually use.
+    let safe = safe.trim_end_matches([' ', '.']).to_string();
+
+    // Limit length. Counted in chars, but truncation must not split a
+    // multi-byte character, which `chars().take()` guarantees.
     let truncated: String = safe.chars().take(128).collect();
 
     // Ensure non-empty
@@ -265,6 +318,91 @@ mod tests {
     fn sanitize_bounds_length() {
         let long = "a".repeat(5000);
         assert!(sanitize_filename(&long).chars().count() <= 128);
+    }
+
+    /// Names that are perfectly legitimate must come back recognisable.
+    ///
+    /// Aegis is meant to be invisible when a file is fine. Handing back
+    /// `R_sum_.pdf` for `Résumé.pdf` is a visible failure, and it used to
+    /// happen to every filename not written in English.
+    #[test]
+    fn sanitize_does_not_mangle_ordinary_names() {
+        for name in [
+            "Résumé.pdf",
+            "отчёт-2026.docx",
+            "報告書.xlsx",
+            "report (final).pdf",
+            "my holiday photo.jpg",
+            "Invoice #42 [paid].pdf",
+            "data,set;v2.csv",
+            "naïve-café.txt",
+            "emoji 🎉 party.png",
+        ] {
+            let out = sanitize_filename(name);
+            assert_eq!(out, name, "{name:?} was mangled into {out:?}");
+        }
+    }
+
+    /// Characters Windows genuinely forbids must still go, especially `:` —
+    /// `notes.txt:payload.exe` is an NTFS alternate data stream, not a name.
+    #[test]
+    fn sanitize_removes_characters_windows_forbids() {
+        for (input, banned) in [
+            ("notes.txt:payload.exe", ':'),
+            ("what?.pdf", '?'),
+            ("a<b>c.txt", '<'),
+            ("pipe|d.txt", '|'),
+            ("star*.doc", '*'),
+            ("quote\".txt", '"'),
+        ] {
+            let out = sanitize_filename(input);
+            assert!(
+                !out.contains(banned),
+                "{banned:?} survived in {out:?} (from {input:?})"
+            );
+        }
+    }
+
+    /// The right-to-left override trick must not survive into a released
+    /// filename. Inside a ZIP `archive.rs` reports it as Critical; on the way
+    /// out to Downloads nothing else would catch it.
+    #[test]
+    fn sanitize_neutralises_bidi_override() {
+        let evil = "invoice\u{202E}fdp.exe";
+        let out = sanitize_filename(evil);
+        assert!(
+            !out.chars().any(|c| matches!(
+                c,
+                '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+            )),
+            "a text-direction override survived into {out:?}"
+        );
+    }
+
+    /// Control characters, including newlines that would corrupt log lines.
+    #[test]
+    fn sanitize_removes_control_characters() {
+        let out = sanitize_filename("re\nport\ttab\r.pdf");
+        assert!(!out.chars().any(|c| c.is_control()), "control char in {out:?}");
+    }
+
+    /// Windows silently drops trailing dots and spaces, so `evil.exe.` opens
+    /// as `evil.exe`. The name Aegis reports must be the one the filesystem
+    /// will use.
+    #[test]
+    fn sanitize_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_filename("evil.exe."), "evil.exe");
+        assert_eq!(sanitize_filename("report.pdf   "), "report.pdf");
+        assert_eq!(sanitize_filename("thing.txt. . ."), "thing.txt");
+    }
+
+    /// Truncation must never split a multi-byte character in half.
+    #[test]
+    fn sanitize_truncation_is_character_safe() {
+        let long = "é".repeat(500);
+        let out = sanitize_filename(&long);
+        assert!(out.chars().count() <= 128);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }
 

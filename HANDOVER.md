@@ -14,7 +14,11 @@ banner saying so.
 
 ## 1. Current state
 
-**Working end to end against real Microsoft Edge.**
+**The code is complete and verified. The deployed copy is not current.**
+
+The binary the browser actually launches (`C:\Aegis\aegis-host.exe`) predates
+this session's work — see §2.2. Everything below describes the repository;
+to put it in front of a browser, run the installer and restart Edge.
 
 ```
 376 tests passing
@@ -62,7 +66,14 @@ requests at all.
   the real quarantine directory (`tests/end_to_end.rs`). The one remaining gap
   is the browser itself calling `onDeterminingFilename` — which needs a human
   clicking a link, since the extension is loaded in the user's own Edge profile.
-  Run `python scripts/serve_test_downloads.py` and work through §6.
+
+  ```
+  powershell -ExecutionPolicy Bypass -File .\scripts\install_native_host.ps1 -Debug_Build
+  python scripts/make_test_files.py
+  python scripts/serve_test_downloads.py
+  ```
+
+  Then `edge://restart`, open `http://127.0.0.1:8000/`, and work through §6.
 - **No licence chosen.**
 - **`install_native_host.sh`** (Linux) is untested against the current layout.
 
@@ -88,11 +99,46 @@ These each cost hours. All verified.
    Chromium browser reads native-host registrations only from its own registry
    hive. `scripts/install_native_host.ps1` handles all of them.
 
-2. **The live host is `aegis-host/target/debug/aegis-host.exe`.** The manifest
-   in play is `extension/native-messaging/com.aegis.sandbox.json`, which points
-   directly at the build output — so `cargo build` makes changes live with no
-   reinstall. **Its log is `aegis-host/target/debug/aegis-host.log`.** Reading
-   the wrong log cost most of one session.
+2. **`cargo build` does NOT make your changes live. Verify before you debug.**
+   Three copies of the host exist and it is easy to spend an afternoon
+   debugging one while the browser runs another. Reading the wrong log already
+   cost most of one session.
+
+   | Location | What it is |
+   |---|---|
+   | `aegis-host/target/debug/aegis-host.exe` | what `cargo build` produces and what `cargo test` runs |
+   | `%LOCALAPPDATA%\Aegis\` | where `scripts/install_native_host.ps1` deploys |
+   | `C:\Aegis\` | **what the registry currently points at** |
+
+   As of this writing all three browser hives — Chrome, Edge and Brave —
+   register `C:\Aegis\com.aegis.sandbox.json`, whose `path` is
+   `C:\Aegis\aegis-host.exe`. That copy is deployed by hand and does not
+   update when you build.
+
+   Check what is actually registered:
+
+   ```powershell
+   (Get-ItemProperty "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\com.aegis.sandbox").'(default)'
+   ```
+
+   To make the current build live, run the installer — it copies the binary
+   and `aegis.toml` into `%LOCALAPPDATA%\Aegis` and repoints every hive:
+
+   ```
+   powershell -ExecutionPolicy Bypass -File .\scripts\install_native_host.ps1 -Debug_Build
+   ```
+
+   Then browse to `edge://restart`. Closing the window is not enough — the
+   registry is read at browser start-up and Edge keeps background processes
+   alive.
+
+   **The log lives next to whichever binary ran**, so
+   `C:\Aegis\aegis-host.log` and `aegis-host/target/debug/aegis-host.log` are
+   different files from different builds. A missing log is the fastest way to
+   tell that the browser never launched the host at all.
+
+   `scripts/verify_native_host.ps1` walks this whole chain and names the
+   broken link.
 
 3. **Chromium rewrites the file extension.** You suggest `{uuid}.aegispart`;
    the browser re-applies its own extension from the MIME type, so a PDF lands

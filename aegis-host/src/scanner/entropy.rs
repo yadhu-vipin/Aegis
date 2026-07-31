@@ -184,7 +184,25 @@ pub fn analyse(data: &[u8], claimed_ext: &str) -> Result<EntropyResult> {
         // A localised high-entropy region inside otherwise ordinary content is
         // the shape of an embedded encrypted payload — more specific than a
         // high whole-file average.
-        if result.max_window > 7.5 && result.overall < 6.5 && data.len() > WINDOW_SIZE * 2 {
+        //
+        // NOT applied to executables. A normal PE is full of high-entropy
+        // pockets by design: compressed resources in `.rsrc`, embedded PNG and
+        // ICO icons, and the Authenticode certificate blob appended after the
+        // last section. `notepad.exe` trips this at offset 180224 with a window
+        // measuring 7.96 against a whole-file 6.48 — the check is describing
+        // Windows' own resource compression and calling it a hidden payload.
+        //
+        // A signal that fires on essentially every signed Windows binary
+        // carries no information about the one being scanned. The whole-file
+        // threshold above still applies to executables, and that one is
+        // meaningful: a fully packed binary is uniformly high-entropy, which is
+        // a different shape entirely.
+        let is_executable = data.starts_with(b"MZ") || data.starts_with(b"\x7FELF");
+        if !is_executable
+            && result.max_window > 7.5
+            && result.overall < 6.5
+            && data.len() > WINDOW_SIZE * 2
+        {
             let r = 0.45;
             result.findings.push(Finding::new(
                 Severity::Medium,
@@ -280,18 +298,65 @@ mod tests {
     /// carrying a payload.
     #[test]
     fn localised_high_entropy_region_is_detected() {
-        let mut data = b"MZ\x90\x00".to_vec();
-        data.extend(b"ordinary program text and strings ".repeat(500));
+        // A legacy OLE document: not text, not a compressed container, and not
+        // an executable — so the windowed check applies. This is also the
+        // realistic shape of the thing being detected, an Office document with
+        // an encrypted payload embedded in it.
+        let mut data = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".to_vec();
+        data.extend(b"ordinary document text and strings ".repeat(500));
         data.extend(pseudo_random(6000));
         data.extend(b"more ordinary trailing content ".repeat(500));
 
-        let res = analyse(&data, "exe").unwrap();
+        let res = analyse(&data, "doc").unwrap();
         assert!(
             res.max_window > 7.5,
             "embedded random region not found, max window {}",
             res.max_window
         );
         assert!(res.flagged, "localised high-entropy region not flagged");
+    }
+
+    /// Executables are exempt from the windowed check, and must be.
+    ///
+    /// A normal PE is full of high-entropy pockets: compressed resources,
+    /// embedded PNG and ICO icons, and the Authenticode certificate appended
+    /// after the last section. `notepad.exe` trips the raw measurement at 7.96
+    /// against a whole-file 6.48 — so without this exemption the check reports
+    /// Windows' own resource compression as a hidden encrypted payload, on
+    /// essentially every signed binary in existence.
+    #[test]
+    fn executables_are_exempt_from_the_windowed_check() {
+        let mut data = b"MZ\x90\x00".to_vec();
+        data.extend(b"ordinary program text and strings ".repeat(500));
+        data.extend(pseudo_random(6000)); // stands in for a compressed .rsrc
+        data.extend(b"more ordinary trailing content ".repeat(500));
+
+        let res = analyse(&data, "exe").unwrap();
+        assert!(
+            res.max_window > 7.5,
+            "fixture should still contain a high-entropy window"
+        );
+        assert!(
+            !res.findings.iter().any(|f| f.title.contains("Encrypted block")),
+            "a PE with a compressed resource section was reported as carrying a \
+             hidden encrypted payload: {:?}",
+            res.flags
+        );
+    }
+
+    /// The whole-file threshold still applies to executables, and should: a
+    /// fully packed binary is uniformly high-entropy, which is a different
+    /// shape from one high-entropy section.
+    #[test]
+    fn fully_packed_executable_is_still_flagged() {
+        let mut data = b"MZ\x90\x00".to_vec();
+        data.extend(pseudo_random(60_000));
+
+        let res = analyse(&data, "exe").unwrap();
+        assert!(
+            res.flagged,
+            "a uniformly high-entropy executable should still be flagged as packed"
+        );
     }
 
     #[test]

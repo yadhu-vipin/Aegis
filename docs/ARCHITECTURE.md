@@ -185,11 +185,26 @@ packed executable trips entropy *and* PE section checks for the same underlying
 fact; summing would double-count it and push ordinary packed software past the
 block threshold.
 
-**Across the two passes: sum.** "The extension lies about the type" and "a ZIP
-is appended after the image data" are genuinely independent facts.
+**Across the two passes: sum — unless the import table was parsed.** "The
+extension lies about the type" and "a ZIP is appended after the image data" are
+genuinely independent facts and add up. But the streaming pass finds API names
+by searching for *strings* while the whole-file pass finds them in the *import
+table*, and for a PE those are the same evidence twice over. Where the import
+table is available it supersedes the string scan rather than adding to it.
 
 **One signal can subtract.** A valid Authenticode signature is the only input
 that lowers a score, under the strict rule in §7.
+
+**Weak evidence stays weak.** String matches on API names accumulate to a hard
+ceiling (`MAX_INDICATIVE_RISK = 0.35`) that sits *below* the sandbox threshold,
+so they can never move a file out of Release on their own. Only literal attack
+payloads — reverse shell command lines, autorun registry paths — carry full
+weight from a string match.
+
+This is not conservatism for its own sake. Without those rules Aegis blocked
+Microsoft-signed `notepad.exe` at maximum risk, because it references
+`RegSetValue`, `RegCreateKey`, `ShellExecuteW` and `IsDebuggerPresent` like
+every other Windows program. See §10 and DECISIONS.md.
 
 ### Two checks worth explaining
 
@@ -371,13 +386,31 @@ merely does not use its network stack.
 
 ## 10. Testing
 
-351 tests. The ones that matter most are not the ones that check detection.
+376 tests. The ones that matter most are not the ones that check detection.
 
-**Several tests assert that ordinary files are RELEASED.** Every check added to
-Aegis is a fresh chance to start blocking legitimate downloads, and a scanner
-that blocks everything is indistinguishable from a broken one. `archive.rs`
-carries the same guard internally: an ordinary installer archive must stay below
-the threshold, because archives containing programs are completely normal.
+**Several tests assert that ordinary files are RELEASED**, and that half of the
+suite has already earned its place.
+
+Aegis blocked Microsoft-signed `notepad.exe` at risk 1.00 while 240 unit tests
+were green. Four defects compounded, every one of them the same mistake —
+treating an accumulation of weak evidence as strong evidence:
+
+1. String matches on API names **summed** without bound. Notepad references
+   four ordinary Windows APIs; they added to 1.25.
+2. The same API was counted **twice** — once as a string in the streaming pass,
+   once as an import in the whole-file pass — and the two were summed.
+3. A **per-chunk bonus** added 0.05 per flagged chunk, counting one fact
+   repeatedly and silently defeating the cap introduced to fix (1).
+4. Signals that fire on **every** Windows binary — `GetProcAddress`,
+   `IsDebuggerPresent`, a high-entropy resource section — were weighted as
+   though they were rare.
+
+None of this was visible to code review, and no detection test could have
+caught it: **a scanner that blocks everything passes every detection test ever
+written.** `tests/end_to_end.rs` now runs both directions through the real
+binary, and `archive.rs` carries the same guard internally — an ordinary
+installer archive must stay below the threshold, because archives containing
+programs are completely normal.
 
 **`tests/real_containers.rs` uses containers written by real Windows tools** —
 `Compress-Archive`, Explorer shortcuts — not by our own encoder. A parser

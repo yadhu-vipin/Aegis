@@ -96,24 +96,43 @@ static DANGEROUS_IMPORTS: &[(&str, &str, f32, &str)] = &[
     ("BitBlt", "screen capture", 0.35, "copies the screen contents"),
 
     // --- Persistence ---
-    ("RegSetValueExA", "persistence", 0.4, "writes to the Windows registry"),
-    ("RegSetValueExW", "persistence", 0.4, "writes to the Windows registry"),
+    //
+    // Writing to the registry is how Windows programs store settings. Notepad
+    // does it to remember your word-wrap preference. Persistence is about
+    // *where* a program writes — the Run keys — and an import table cannot show
+    // that: the key path is a string resolved at runtime, not a declaration.
+    // `intent.rs` matches the specific autorun paths and treats those as
+    // decisive; this stays low because the API alone says almost nothing.
+    ("RegSetValueExA", "persistence", 0.1, "writes to the Windows registry"),
+    ("RegSetValueExW", "persistence", 0.1, "writes to the Windows registry"),
     ("CreateServiceA", "persistence", 0.6, "installs a Windows service that starts automatically"),
     ("CreateServiceW", "persistence", 0.6, "installs a Windows service that starts automatically"),
     ("SetFileAttributesA", "hiding", 0.3, "changes file visibility"),
     ("SetFileAttributesW", "hiding", 0.3, "changes file visibility"),
 
     // --- Anti-analysis ---
-    ("IsDebuggerPresent", "anti-analysis", 0.45, "checks whether it is being examined"),
+    //
+    // `IsDebuggerPresent` scores near zero despite being a genuine
+    // anti-analysis API, because the MSVC C runtime calls it during start-up:
+    // it is present in a large share of all Windows binaries ever compiled,
+    // including `notepad.exe`. A signal that fires on everything distinguishes
+    // nothing. Reported for context, weighted as the near-noise it is.
+    ("IsDebuggerPresent", "anti-analysis", 0.05, "checks whether it is being examined"),
     ("CheckRemoteDebuggerPresent", "anti-analysis", 0.5, "checks whether it is being examined"),
     ("NtQueryInformationProcess", "anti-analysis", 0.45, "inspects process state, often to detect analysis"),
     ("OutputDebugStringA", "anti-analysis", 0.25, "can be used to detect a debugger"),
 
     // --- Dynamic resolution: how packed code hides what it calls ---
-    ("GetProcAddress", "dynamic API resolution", 0.3,
+    //
+    // Same base-rate problem, more severe. Essentially every non-trivial
+    // Windows program calls `GetProcAddress` and `LoadLibrary` — that is how
+    // optional OS features are used at all. What is suspicious is a program
+    // that imports these *and almost nothing else*, which the import-count
+    // check below already detects far more specifically.
+    ("GetProcAddress", "dynamic API resolution", 0.05,
      "looks up functions by name at runtime instead of declaring them"),
-    ("LoadLibraryA", "dynamic API resolution", 0.3, "loads additional code at runtime"),
-    ("LoadLibraryW", "dynamic API resolution", 0.3, "loads additional code at runtime"),
+    ("LoadLibraryA", "dynamic API resolution", 0.05, "loads additional code at runtime"),
+    ("LoadLibraryW", "dynamic API resolution", 0.05, "loads additional code at runtime"),
 
     // --- Download-and-run ---
     ("URLDownloadToFileA", "payload download", 0.7, "downloads a file from the internet"),

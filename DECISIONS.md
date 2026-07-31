@@ -915,3 +915,127 @@ The popup labels the section by outcome — "Notes on this file" when delivered,
 "Why this was not delivered" when not — because rendering a signature
 identically to a block reason would make every cleared download look like a near
 miss.
+
+---
+
+# Phase 7 — Calibration, found by running it
+
+Everything below was found by putting `notepad.exe` — signed by Microsoft,
+shipped with Windows — through the real pipeline. Every unit test passed
+throughout. This is the clearest example yet of why this project's standing
+rule is *run it, don't just read it*.
+
+**Aegis blocked `notepad.exe` at risk 1.00.**
+
+Four separate defects compounded. Each looked reasonable in isolation, and
+each is the same underlying mistake: **treating an accumulation of weak
+evidence as strong evidence.**
+
+## 1. String matches summed without bound (`intent.rs`)
+
+`cumulative_risk = (cumulative_risk + risk).min(1.0)` over the red-flag table.
+Notepad references `RegSetValue` (0.30), `RegCreateKey` (0.25),
+`ShellExecuteW` (0.35) and `IsDebuggerPresent` (0.35) — four ordinary Windows
+APIs summing to 1.25, capped to 1.00, blocked outright.
+
+`pe.rs` already documented why this is wrong: a string "can come from anywhere
+in the file", whereas an import "means the loader has been *told* to resolve
+that function". The code stated the principle in one module and violated it in
+another.
+
+**Decision:** split the table into `Decisive` and `Indicative`.
+
+- **Decisive** — literal attack payloads: reverse shells, autorun registry
+  paths, EICAR. No benign program contains one. Full weight, combined by max
+  (two reverse shells are one fact, not two).
+- **Indicative** — API names. Accumulate up to `MAX_INDICATIVE_RISK` and no
+  further.
+
+`MAX_INDICATIVE_RISK = 0.35`, set below `sandbox_threshold` (0.40), not merely
+below `block_threshold`. That is the stronger claim and the right one: **API
+names in a program are not evidence against it.** An intermediate value of 0.6
+was tried first and still left notepad undeliverable at 0.65 — a quieter false
+positive, equally wrong, because every ordinary Windows program lands there.
+
+These strings earn their place as *corroboration*. Beside a magic-byte
+mismatch — API names in a file claiming to be a JPEG — they push a verdict over
+the line, and `deep_forensic_scan` adds the two together for exactly that case.
+
+## 2. The same evidence counted twice across passes (`scanner/mod.rs`)
+
+`IsDebuggerPresent` matched as a string in the streaming pass AND appeared in
+the import table in the whole-file pass. `combine()` summed the two.
+
+This is the double-counting that `whole_file_scan`'s max-not-sum rule exists to
+prevent, happening across the pass boundary where that rule did not reach.
+
+**Decision:** when a PE import table was parsed, the import analysis
+*supersedes* the string scan rather than adding to it — `max`, not `+`. Where
+both are available the import table wins outright, for the reason `pe.rs`
+already gives. Files with no import table (scripts, archives, documents) still
+sum, because there the string scan is the only evidence available.
+
+## 3. A per-chunk bonus that defeated the cap (`risk/mod.rs`)
+
+`aggregate_risk` added 0.05 per flagged chunk, up to 0.2, on the reasoning that
+many small signals add up.
+
+They do not: the chunks are not independent observations. A large binary
+mentions the same handful of strings in whichever chunks they land in, so the
+bonus was counting one fact repeatedly. It also silently defeated the cap in
+§1 — capped 0.35, plus 0.05, landed notepad on exactly the 0.40 threshold.
+
+**Decision:** removed. `aggregate_risk` is the maximum and nothing else.
+Genuinely independent signals combine in `scanner::combine`, which is the right
+place for it.
+
+## 4. Base-rate signals weighted as if rare
+
+Three checks fired on notepad that fire on essentially every Windows binary:
+
+| Signal | Was | Now | Why |
+|---|---|---|---|
+| Windowed high entropy in a PE | 0.45 | exempt | `.rsrc` compression, embedded icons, and the Authenticode blob itself are high-entropy by design |
+| `IsDebuggerPresent` import | 0.45 | 0.05 | emitted by the MSVC C runtime at start-up |
+| `GetProcAddress` / `LoadLibrary` import | 0.30 | 0.05 | how every program uses optional OS features |
+| `RegSetValueEx` import | 0.40 | 0.10 | how every program stores settings |
+
+**A signal that fires on everything distinguishes nothing.** This is the same
+principle already applied in `archive.rs`, where "contains an executable"
+scores 0.15 because that is what an installer *is*.
+
+The entropy exemption is narrow and deliberate: only the *windowed* check is
+skipped for executables. The whole-file threshold still applies, and it is
+still meaningful — a fully packed binary is uniformly high-entropy, which is a
+different shape from one compressed resource section. A test pins both halves.
+
+Persistence is worth a note: an import table cannot show it. `RegSetValueEx`
+says a program writes to the registry, which Notepad does to remember your
+word-wrap setting. What makes it persistence is *which key*, and the key path
+is a runtime string, not a declaration. `intent.rs` matches the specific Run
+paths and treats those as Decisive; the API alone stays near zero.
+
+## What this cost, and what it bought
+
+Verdict on `notepad.exe`, across the four fixes:
+
+```
+1.00  BLOCKED        four API names summed
+0.85  BLOCKED        after capping strings at 0.6
+0.65  not delivered  after import supersession
+0.40  not delivered  after base-rate recalibration
+0.00  RELEASED       after removing the per-chunk bonus
+```
+
+Detection was verified not to regress at each step. A program named `.jpg`, a
+ZIP hiding `invoice.pdf.exe`, a macro in a `.docx`, a polyglot PNG and a packed
+executable are all still caught, and there are now tests pinning each one
+through the real binary.
+
+**The lesson is about test design, not about thresholds.** 240 unit tests
+passed while the scanner blocked Notepad, because every one of them asked "is
+malware detected?" and none asked "is ordinary software delivered?". A scanner
+that blocks everything passes every detection test ever written.
+
+`tests/end_to_end.rs` now runs both directions, and the released-side cases are
+the ones more likely to catch a regression.

@@ -195,8 +195,22 @@ if something does not work.
 cd aegis-host && cargo test
 ```
 
-351 tests: 125 unit, 103 fuzz, 12 IPC round-trip, 107 against containers written
-by real Windows tools, and 4 sample-based.
+376 tests: 131 unit, 108 fuzz, 12 IPC round-trip, 112 against containers written
+by real Windows tools, 9 end-to-end through the real binary, and 4 sample-based.
+
+To regenerate the end-to-end fixtures and try it through a browser:
+
+```bash
+python scripts/make_test_files.py && python scripts/serve_test_downloads.py
+```
+
+**Half the end-to-end tests assert that ordinary files are RELEASED**, and that
+half matters more. A scanner that blocks everything passes every detection test
+ever written — and this one did exactly that: 240 unit tests were green while
+Aegis blocked Microsoft-signed `notepad.exe` at maximum risk, because four
+ordinary Windows API names were being summed. Four separate defects compounded,
+all of them the same mistake of treating accumulated weak evidence as strong
+evidence. `DECISIONS.md` documents each.
 
 The fuzz suite runs 41,200 mutation cases against every parser on each
 invocation, checking for panics *and* hangs. A crash in a security tool is an

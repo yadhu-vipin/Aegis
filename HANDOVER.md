@@ -17,11 +17,12 @@ banner saying so.
 **Working end to end against real Microsoft Edge.**
 
 ```
-351 tests passing
-  125  unit
-  103  fuzz (41,200 mutation cases per run)
+376 tests passing
+  131  unit
+  108  fuzz (41,200 mutation cases per run)
+  112  against containers written by real Windows tools
    12  IPC round-trip against the real binary
-  107  against containers written by real Windows tools
+    9  end-to-end verdicts through the real binary
     4  sample-based
 
 cargo clippy --all-targets -- -D warnings   clean
@@ -56,13 +57,26 @@ requests at all.
 
 ### Not yet done
 
-- **End-to-end verification of the new checks in a live browser.** The archive,
-  auto-execution and signature checks are covered by unit, integration and
-  real-container tests, but have not been driven through Edge by an actual
-  download. Given this project's history that is the verification that counts —
-  see §4.
+- **A download performed by an actual browser.** All six cases from §6 are now
+  driven through the real host binary over the real protocol, with real files in
+  the real quarantine directory (`tests/end_to_end.rs`). The one remaining gap
+  is the browser itself calling `onDeterminingFilename` — which needs a human
+  clicking a link, since the extension is loaded in the user's own Edge profile.
+  Run `python scripts/serve_test_downloads.py` and work through §6.
 - **No licence chosen.**
 - **`install_native_host.sh`** (Linux) is untested against the current layout.
+
+### A warning worth carrying forward
+
+`notepad.exe` — signed by Microsoft, shipped with Windows — was **blocked at
+risk 1.00** while 240 unit tests were green. Four defects compounded, all the
+same mistake: treating an accumulation of weak evidence as strong evidence.
+Full detail in DECISIONS.md ("Phase 7 — Calibration, found by running it").
+
+The lesson is about test design. Every test asked *is malware detected?* and
+none asked *is ordinary software delivered?* — and a scanner that blocks
+everything passes the first kind perfectly. If you add a check, add a
+false-positive test with it.
 
 ---
 
@@ -137,7 +151,8 @@ aegis-host/src/
     signature.rs   Authenticode + catalog; apply_trust_credit()
 
 aegis-host/tests/
-  ipc_roundtrip.rs    real binary over a real pipe
+  ipc_roundtrip.rs    real binary over a real pipe: protocol and hostile frames
+  end_to_end.rs       the six cases in section 6, driven through the real binary
   fuzz_parsers.rs     41,200 mutation cases; no panic AND no hang
   real_containers.rs  archives written by Compress-Archive, Explorer shortcuts
   scanner_samples.rs  the files in test_files/

@@ -44,6 +44,12 @@ pub struct ForensicResult {
     pub pe_anomaly: bool,
     /// The file is a format that runs something when opened.
     pub auto_execution: bool,
+    /// A PE import table was successfully parsed during the whole-file pass.
+    ///
+    /// When true, the streaming intent scan's string matches are *superseded*
+    /// rather than added to — see [`combine`]. The two measure the same thing
+    /// and the import table measures it better.
+    pub imports_analysed: bool,
     /// What Authenticode says about the file, when it was checkable.
     pub signature_status: Option<signature::TrustStatus>,
     pub risk_score: f32,
@@ -209,6 +215,7 @@ pub fn whole_file_scan_at(
         entropy_anomaly: entropy_result.flagged,
         pe_anomaly: pe_result.flagged,
         auto_execution: autoexec_result.flagged,
+        imports_analysed: pe_result.is_pe && pe_result.import_function_count > 0,
         signature_status: signature_result.status,
         risk_score,
         descriptions,
@@ -237,6 +244,31 @@ pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> Foren
     // that matters, not whichever check happened to run first.
     finding::sort_by_severity(&mut findings);
 
+    // Sum, EXCEPT when the import table was parsed — then take the maximum.
+    //
+    // The streaming pass finds API names by searching raw bytes for strings.
+    // The whole-file pass finds them in the import table. For a PE these are
+    // the same evidence twice over: `IsDebuggerPresent` matches as a string
+    // AND appears as an import, and summing counted one fact as two.
+    //
+    // That is not a rounding error. `notepad.exe` referenced four ordinary
+    // Windows APIs and was blocked at 1.00 — a Microsoft-signed binary,
+    // rejected because it mentioned the registry. Every real Windows program
+    // contains these strings.
+    //
+    // Where both are available the import table wins outright: a string can
+    // appear anywhere in a file, while an import is a declaration to the
+    // loader that cannot be there by accident. So the string score is
+    // superseded rather than added.
+    //
+    // Files with no import table (scripts, archives, documents) still sum,
+    // because there the string scan is the only evidence there is.
+    let risk_score = if whole_file.imports_analysed {
+        streaming.risk_score.max(whole_file.risk_score)
+    } else {
+        streaming.risk_score + whole_file.risk_score
+    };
+
     ForensicResult {
         header_valid: streaming.header_valid,
         extension_mismatch: streaming.extension_mismatch,
@@ -245,8 +277,9 @@ pub fn combine(streaming: &ForensicResult, whole_file: &ForensicResult) -> Foren
         entropy_anomaly: whole_file.entropy_anomaly,
         pe_anomaly: whole_file.pe_anomaly,
         auto_execution: whole_file.auto_execution,
+        imports_analysed: whole_file.imports_analysed,
         signature_status: whole_file.signature_status.clone(),
-        risk_score: (streaming.risk_score + whole_file.risk_score).min(1.0),
+        risk_score: risk_score.min(1.0),
         descriptions,
         findings,
     }

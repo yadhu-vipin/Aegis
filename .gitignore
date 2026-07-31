@@ -5,3 +5,20 @@ target/
 **/target/
 __pycache__/
 .ipynb_checkpoints/
+
+# Generated end-to-end fixtures — run scripts/make_test_files.py to recreate.
+#
+# Deliberately not committed. Several are built to look malicious (an archive
+# hiding invoice.pdf.exe, a .docx carrying a macro stream), and a repository
+# full of files that trip antivirus scanners is its own problem — for anyone
+# cloning it, and for the scanners. One is also a 360 KB copy of a Windows
+# system binary, which belongs to Microsoft rather than in this repo.
+test_files/benign_document.pdf
+test_files/invoice_archive.zip
+test_files/ordinary_project.zip
+test_files/protected_documents.zip
+test_files/quarterly_report.docx
+test_files/signed_windows_binary.exe
+
+# The host writes its log next to the binary.
+*.log

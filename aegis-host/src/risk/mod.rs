@@ -61,20 +61,27 @@ pub fn decide(result: &ForensicResult, config: &RiskConfig) -> Decision {
     }
 }
 
-/// Accumulate risk scores from multiple chunk scans into a single aggregate.
-/// Uses the maximum observed risk score (conservative) plus a small bonus
-/// for the number of flagged chunks (many small signals = higher overall risk).
+/// Collapse per-chunk scores into one score for the whole streaming pass.
+///
+/// The **maximum**, and nothing else.
+///
+/// This used to add a bonus of 0.05 per flagged chunk, on the reasoning that
+/// many small signals add up to a larger one. They do not, because the chunks
+/// are not independent observations: a large binary that mentions
+/// `IsDebuggerPresent` mentions it in whichever chunk that string lands in, and
+/// if the file is big enough the same handful of strings flag chunk after
+/// chunk. That is one fact counted repeatedly, not accumulating evidence.
+///
+/// It also silently defeated the cap in `intent.rs`. That cap exists to keep
+/// string matches below `sandbox_threshold`, so API names alone cannot stop a
+/// file being delivered — and then this added 0.05 on top and pushed the total
+/// back over the line. `notepad.exe` scored exactly 0.40 against a 0.40
+/// threshold, entirely because of this bonus.
+///
+/// Genuinely independent signals are combined in `scanner::combine`, which is
+/// the right place for it: there the inputs really are different observations.
 pub fn aggregate_risk(chunk_scores: &[f32]) -> f32 {
-    if chunk_scores.is_empty() {
-        return 0.0;
-    }
-    let max_score = chunk_scores
-        .iter()
-        .cloned()
-        .fold(0.0f32, f32::max);
-    let flagged_count = chunk_scores.iter().filter(|&&s| s > 0.0).count();
-    let multi_chunk_bonus = (flagged_count as f32 * 0.05).min(0.2);
-    (max_score + multi_chunk_bonus).min(1.0)
+    chunk_scores.iter().cloned().fold(0.0f32, f32::max).min(1.0)
 }
 
 #[cfg(test)]
@@ -127,8 +134,30 @@ mod tests {
     fn aggregate_is_empty_safe_and_bounded() {
         assert_eq!(aggregate_risk(&[]), 0.0);
         assert!(aggregate_risk(&[1.0, 1.0, 1.0, 1.0, 1.0]) <= 1.0);
-        // Max dominates; the multi-chunk bonus only adds on top of it.
-        assert!(aggregate_risk(&[0.5]) >= 0.5);
-        assert!(aggregate_risk(&[0.1, 0.1, 0.1]) > aggregate_risk(&[0.1]));
+        assert_eq!(aggregate_risk(&[0.5]), 0.5);
+        assert_eq!(aggregate_risk(&[0.2, 0.7, 0.1]), 0.7);
+    }
+
+    /// Repeating a weak signal across chunks must not manufacture a strong one.
+    ///
+    /// This is the regression guard for a real false positive: a large binary
+    /// mentions the same handful of API names in chunk after chunk, and the
+    /// old per-chunk bonus turned that repetition into risk. It also silently
+    /// defeated the cap in `intent.rs`, pushing `notepad.exe` to exactly the
+    /// 0.40 threshold and holding a Microsoft-signed file.
+    #[test]
+    fn repeated_weak_signals_do_not_accumulate() {
+        let one = aggregate_risk(&[0.35]);
+        let many = aggregate_risk(&[0.35; 200]);
+        assert_eq!(
+            one, many,
+            "the same score repeated across 200 chunks produced {many} instead \
+             of {one} — repetition is not new evidence"
+        );
+        assert!(
+            many < 0.4,
+            "capped string matches must stay below sandbox_threshold however \
+             many chunks they appear in, got {many}"
+        );
     }
 }
